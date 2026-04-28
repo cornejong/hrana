@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "hrana"
+version = "0.1.0"
+description = "Python DB-API 2.0 client for the Hrana protocol"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+websocket = ["websocket-client>=1.6"]
+dev = ["pytest>=8", "websocket-client>=1.6"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hrana*"]

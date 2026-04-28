@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hrana Console</title>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg: #0d1117;
+            --bg-raised: #161b22;
+            --bg-overlay: #1c2128;
+            --bg-active: #21262d;
+            --border: #30363d;
+            --border-sub: #21262d;
+            --text: #e6edf3;
+            --text-muted: #8b949e;
+            --text-sub: #484f58;
+            --accent: #388bfd;
+            --accent-dim: rgba(56, 139, 253, .18);
+            --green: #3fb950;
+            --red: #f85149;
+            --orange: #d29922;
+            --mono: 'Menlo', 'Consolas', ui-monospace, monospace;
+        }
+
+        html,
+        body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            display: grid;
+            grid-template-rows: 48px 1fr 28px;
+            height: 100vh;
+        }
+
+        /* ─────────────── Header ─────────────── */
+        header {
+            background: var(--bg-raised);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 1rem;
+            gap: .85rem;
+            flex-shrink: 0;
+            user-select: none;
+        }
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            gap: .3rem;
+        }
+
+        .brand-name {
+            font-size: .95rem;
+            font-weight: 700;
+            letter-spacing: -.01em;
+        }
+
+        .brand-tag {
+            font-size: .65rem;
+            font-weight: 600;
+            letter-spacing: .1em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: var(--accent-dim);
+            border: 1px solid rgba(56, 139, 253, .3);
+            padding: .1rem .4rem;
+            border-radius: 4px;
+        }
+
+        .hdivider {
+            width: 1px;
+            height: 20px;
+            background: var(--border);
+        }
+
+        .conn-pill {
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+            background: var(--bg-overlay);
+            border: 1px solid var(--border);
+            padding: .22rem .7rem;
+            border-radius: 20px;
+            font-size: .75rem;
+            color: var(--text-muted);
+        }
+
+        #status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-sub);
+            flex-shrink: 0;
+            transition: background .3s;
+        }
+
+        #status-dot.connected {
+            background: var(--green);
+            box-shadow: 0 0 5px var(--green);
+        }
+
+        #status-dot.error {
+            background: var(--red);
+        }
+
+        #status-text {
+            max-width: 340px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .header-gap {
+            flex: 1;
+        }
+
+        .header-stats {
+            display: flex;
+            align-items: center;
+            gap: 1.2rem;
+            font-size: .71rem;
+            color: var(--text-muted);
+        }
+
+        #cache-size-text {
+            color: var(--accent);
+            font-size: .7rem;
+        }
+
+        /* ─────────────── Main layout ─────────────── */
+        main {
+            display: grid;
+            grid-template-columns: 256px 1fr;
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        /* ─────────────── Sidebar ─────────────── */
+        .sidebar {
+            background: var(--bg-raised);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 3px;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 2px;
+        }
+
+        .sidebar details {
+            border-bottom: 1px solid var(--border-sub);
+            flex-shrink: 0;
+        }
+
+        .sidebar summary {
+            list-style: none;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: .5rem .9rem;
+            font-size: .67rem;
+            font-weight: 700;
+            letter-spacing: .09em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            cursor: pointer;
+            user-select: none;
+            transition: background .12s, color .12s;
+        }
+
+        .sidebar summary:hover {
+            background: var(--bg-overlay);
+            color: var(--text);
+        }
+
+        .sidebar summary::after {
+            content: '›';
+            font-size: .85rem;
+            font-weight: 400;
+            transform: rotate(90deg);
+            display: inline-block;
+            transition: transform .2s;
+        }
+
+        .sidebar details[open] summary::after {
+            transform: rotate(270deg);
+        }
+
+        .sidebar summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .s-body {
+            padding: .55rem .85rem .7rem;
+            display: flex;
+            flex-direction: column;
+            gap: .5rem;
+        }
+
+        /* Fields */
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: .25rem;
+        }
+
+        .field-lbl {
+            font-size: .65rem;
+            color: var(--text-muted);
+            letter-spacing: .04em;
+        }
+
+        .field input,
+        .field select {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: .36rem .55rem;
+            border-radius: 5px;
+            font-size: .81rem;
+            outline: none;
+            width: 100%;
+            transition: border-color .15s;
+        }
+
+        .field input:focus,
+        .field select:focus {
+            border-color: var(--accent);
+        }
+
+        .field select option {
+            background: var(--bg-raised);
+        }
+
+        /* Cache controls */
+        .c-toggle {
+            display: flex;
+            align-items: center;
+            gap: .45rem;
+            font-size: .81rem;
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+
+        .c-toggle input[type="checkbox"] {
+            accent-color: var(--accent);
+            width: auto;
+            cursor: pointer;
+        }
+
+        .c-toggle label {
+            cursor: pointer;
+        }
+
+        .c-sub {
+            padding-left: 1.4rem;
+            display: flex;
+            flex-direction: column;
+            gap: .2rem;
+        }
+
+        .c-sub .field-lbl {
+            font-size: .64rem;
+            color: var(--text-muted);
+            margin-bottom: .1rem;
+        }
+
+        .c-sub input {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: .28rem .45rem;
+            border-radius: 5px;
+            font-size: .78rem;
+            outline: none;
+            width: 100%;
+            transition: border-color .15s;
+        }
+
+        .c-sub input:focus {
+            border-color: var(--accent);
+        }
+
+        .c-actions {
+            display: flex;
+            gap: .3rem;
+            flex-wrap: wrap;
+            padding-top: .15rem;
+        }
+
+        /* Preset list */
+        .preset-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: .15rem;
+        }
+
+        .preset-list li button {
+            width: 100%;
+            text-align: left;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: .28rem .4rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: .78rem;
+            font-family: var(--mono);
+            transition: background .1s, color .1s;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .preset-list li button:hover {
+            background: var(--bg-active);
+            color: var(--text);
+        }
+
+        /* Shared button styles */
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            padding: .3rem .85rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: .78rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: .3rem;
+            transition: opacity .15s;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            opacity: .85;
+        }
+
+        .btn-primary:disabled {
+            background: var(--bg-active);
+            color: var(--text-sub);
+            cursor: not-allowed;
+            opacity: 1;
+        }
+
+        .btn-secondary {
+            background: var(--bg-overlay);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: .3rem .85rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: .78rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: .3rem;
+            transition: background .14s, color .14s;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--bg-active);
+            color: var(--text);
+        }
+
+        .btn-secondary:disabled {
+            opacity: .4;
+            cursor: not-allowed;
+        }
+
+        .btn-ghost {
+            background: var(--bg-overlay);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: .22rem .5rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: .71rem;
+            transition: background .12s, color .12s;
+        }
+
+        .btn-ghost:hover {
+            background: var(--bg-active);
+            color: var(--text);
+        }
+
+        /* ─────────────── Workspace ─────────────── */
+        .workspace {
+            display: grid;
+            grid-template-rows: 38% 4px 1fr;
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        /* ─────────────── Pane shared ─────────────── */
+        .pane {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        .pane-bar {
+            display: flex;
+            align-items: center;
+            gap: .5rem;
+            padding: .42rem .9rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-raised);
+            flex-shrink: 0;
+        }
+
+        .pane-label {
+            font-size: .66rem;
+            font-weight: 700;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            flex: 1;
+        }
+
+        .kbd-hint {
+            font-size: .65rem;
+            color: var(--text-sub);
+        }
+
+        /* ─────────────── Editor ─────────────── */
+        #sql-editor {
+            flex: 1;
+            min-height: 0;
+            background: var(--bg);
+            color: var(--text);
+            border: none;
+            padding: .85rem 1rem;
+            font-family: var(--mono);
+            font-size: .88rem;
+            line-height: 1.65;
+            resize: none;
+            outline: none;
+            tab-size: 2;
+            caret-color: var(--accent);
+        }
+
+        /* ─────────────── Resize handle ─────────────── */
+        .resize-handle {
+            background: var(--border-sub);
+            cursor: row-resize;
+            transition: background .15s;
+            position: relative;
+            z-index: 10;
+            flex-shrink: 0;
+        }
+
+        .resize-handle:hover,
+        .resize-handle.dragging {
+            background: var(--accent);
+        }
+
+        /* ─────────────── Results pane ─────────────── */
+        .results-pane {
+            border-top: none;
+        }
+
+        #result-meta {
+            font-size: .72rem;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+        }
+
+        #timing-text {
+            font-size: .72rem;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+        }
+
+        .cache-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: .22rem;
+            font-size: .64rem;
+            font-weight: 700;
+            letter-spacing: .04em;
+            background: var(--accent-dim);
+            color: var(--accent);
+            border: 1px solid rgba(56, 139, 253, .3);
+            padding: .07rem .38rem;
+            border-radius: 10px;
+        }
+
+        .cache-badge::before {
+            content: '⚡';
+            font-size: .6rem;
+        }
+
+        .results-body {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            padding: .85rem 1rem;
+        }
+
+        .results-body::-webkit-scrollbar {
+            width: 5px;
+            height: 5px;
+        }
+
+        .results-body::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        /* ─────────────── Pagination bar ─────────────── */
+        .pagination-bar {
+            display: flex;
+            align-items: center;
+            gap: .55rem;
+            padding: .35rem .9rem;
+            border-bottom: 1px solid var(--border-sub);
+            background: var(--bg-overlay);
+            font-size: .76rem;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+
+        .pagination-bar button {
+            background: var(--bg-raised);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: .2rem .58rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: .73rem;
+            transition: background .12s, color .12s;
+        }
+
+        .pagination-bar button:hover:not(:disabled) {
+            background: var(--bg-active);
+            color: var(--text);
+        }
+
+        .pagination-bar button:disabled {
+            opacity: .3;
+            cursor: not-allowed;
+        }
+
+        #page-info {
+            color: var(--text-muted);
+            min-width: 7.5rem;
+            text-align: center;
+            font-size: .73rem;
+        }
+
+        .page-size-wrap {
+            display: flex;
+            align-items: center;
+            gap: .32rem;
+            margin-left: auto;
+            color: var(--text-muted);
+            font-size: .73rem;
+        }
+
+        .page-size-wrap input {
+            width: 3.5rem;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: .18rem .35rem;
+            border-radius: 5px;
+            font-size: .73rem;
+            outline: none;
+            text-align: center;
+            transition: border-color .15s;
+        }
+
+        .page-size-wrap input:focus {
+            border-color: var(--accent);
+        }
+
+        /* ─────────────── Table ─────────────── */
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            font-size: .82rem;
+        }
+
+        thead tr {
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            text-align: left;
+            padding: .35rem .8rem;
+            color: var(--text-muted);
+            font-size: .67rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .07em;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: .3rem .8rem;
+            border-bottom: 1px solid var(--border-sub);
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: .81rem;
+            white-space: pre;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr:hover td {
+            background: var(--bg-overlay);
+        }
+
+        .null-val {
+            color: var(--text-sub);
+            font-style: italic;
+        }
+
+        .int-val {
+            color: #79c0ff;
+        }
+
+        .float-val {
+            color: #a5f3fc;
+        }
+
+        .blob-val {
+            color: #f9a8d4;
+            font-style: italic;
+        }
+
+        /* ─────────────── Log ─────────────── */
+        .log {
+            font-family: var(--mono);
+            font-size: .8rem;
+            line-height: 1.85;
+        }
+
+        .log .error {
+            color: var(--red);
+        }
+
+        .log .info {
+            color: var(--text-muted);
+        }
+
+        .log .ok {
+            color: var(--green);
+        }
+
+        /* ─────────────── Footer ─────────────── */
+        footer {
+            background: var(--bg-raised);
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 1rem;
+            gap: 1.25rem;
+            font-size: .67rem;
+            color: var(--text-sub);
+            flex-shrink: 0;
+            user-select: none;
+        }
+
+        footer span+span::before {
+            content: '·';
+            margin-right: 1.25rem;
+            color: var(--border);
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <div class="brand">
+            <span class="brand-name">Hrana</span>
+            <span class="brand-tag">Console</span>
+        </div>
+        <div class="hdivider"></div>
+        <div class="conn-pill">
+            <span id="status-dot"></span>
+            <span id="status-text">Not connected</span>
+        </div>
+        <div class="header-gap"></div>
+        <div class="header-stats">
+            <span id="cache-size-text"></span>
+        </div>
+    </header>
+
+    <main>
+        <!-- ── Sidebar ── -->
+        <aside class="sidebar">
+
+            <details open>
+                <summary>Connection</summary>
+                <div class="s-body">
+                    <div class="field">
+                        <span class="field-lbl">Server URL</span>
+                        <input id="url-input" type="text" value="http://localhost:8080" spellcheck="false" />
+                    </div>
+                    <div class="field">
+                        <span class="field-lbl">Auth Token</span>
+                        <input id="token-input" type="password" placeholder="Bearer token (optional)" />
+                    </div>
+                    <div class="field">
+                        <span class="field-lbl">Protocol Version</span>
+                        <select id="version-select">
+                            <option value="v3" selected>v3 — default</option>
+                            <option value="v2">v2</option>
+                            <option value="v1">v1 — WebSocket only</option>
+                        </select>
+                    </div>
+                </div>
+            </details>
+
+            <details open>
+                <summary>Cache</summary>
+                <div class="s-body">
+                    <div class="c-toggle">
+                        <input type="checkbox" id="cache-memory" />
+                        <label for="cache-memory">Memory cache</label>
+                    </div>
+                    <div class="c-sub" id="cache-ttl-row" style="display:none">
+                        <span class="field-lbl">TTL (ms)</span>
+                        <input type="number" id="cache-ttl" value="60000" min="100" step="1000" />
+                    </div>
+                    <div class="c-toggle">
+                        <input type="checkbox" id="cache-persist" />
+                        <label for="cache-persist">Persist to IndexedDB</label>
+                    </div>
+                    <div class="c-sub" id="cache-group-row" style="display:none">
+                        <span class="field-lbl">Cache group</span>
+                        <input type="text" id="cache-group" placeholder="default" />
+                    </div>
+                    <div class="c-actions">
+                        <button class="btn-ghost" onclick="clearMemoryCache()">Clear memory</button>
+                        <button class="btn-ghost" onclick="clearPersistentCache()">Clear IDB</button>
+                        <button class="btn-ghost" onclick="inspectPersistentCache()">Inspect IDB</button>
+                    </div>
+                </div>
+            </details>
+
+            <details open>
+                <summary>Presets</summary>
+                <div class="s-body" style="padding-top:.35rem">
+                    <ul class="preset-list">
+                        <li><button
+                                onclick="setSQL(`SELECT name, type\nFROM   sqlite_master\nWHERE  type IN ('table', 'view')\nORDER  BY type, name;`)">Show
+                                tables &amp; views</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  m.name        AS table_name,\n  p.name        AS column,\n  p.type        AS type,\n  p.'notnull'   AS not_null,\n  p.dflt_value  AS default_val,\n  p.pk          AS primary_key\nFROM sqlite_master m\nJOIN pragma_table_info(m.name) p\nWHERE m.type = 'table'\nORDER BY m.name, p.cid;`)">Show
+                                all columns</button></li>
+                        <li><button
+                                onclick="setSQL(`CREATE TABLE IF NOT EXISTS orders (\n  id         INTEGER PRIMARY KEY AUTOINCREMENT,\n  customer   TEXT    NOT NULL,\n  country    TEXT    NOT NULL,\n  product    TEXT    NOT NULL,\n  category   TEXT    NOT NULL,\n  qty        INTEGER NOT NULL DEFAULT 1,\n  unit_price REAL    NOT NULL,\n  status     TEXT    NOT NULL DEFAULT 'pending',\n  placed_at  TEXT    NOT NULL DEFAULT (datetime('now'))\n);`)">①
+                                Create orders table</button></li>
+                        <li><button
+                                onclick="setSQL(`INSERT OR IGNORE INTO orders\n  (id, customer, country, product, category, qty, unit_price, status, placed_at)\nVALUES\n  (1,  'Alice Martin',  'FR', 'Pro Keyboard',    'Hardware', 2, 129.99, 'delivered',  '2025-11-03 09:12:00'),\n  (2,  'Bob Chen',      'US', 'USB-C Hub',        'Hardware', 1,  49.99, 'delivered',  '2025-11-08 14:33:00'),\n  (3,  'Alice Martin',  'FR', 'Noise Cancelling', 'Audio',    1, 299.00, 'delivered',  '2025-11-15 11:05:00'),\n  (4,  'Cora Silva',    'BR', 'Mechanical Mouse', 'Hardware', 3,  79.95, 'shipped',    '2025-12-01 08:20:00'),\n  (5,  'Dan Okeke',     'NG', 'HDMI 4K Cable',    'Cables',   5,  18.00, 'delivered',  '2025-12-04 17:45:00'),\n  (6,  'Eve Nakamura',  'JP', 'Pro Keyboard',     'Hardware', 1, 129.99, 'processing', '2025-12-10 10:00:00'),\n  (7,  'Bob Chen',      'US', 'Webcam HD',        'Video',    2,  89.99, 'shipped',    '2025-12-14 13:15:00'),\n  (8,  'Cora Silva',    'BR', 'Noise Cancelling', 'Audio',    1, 299.00, 'delivered',  '2025-12-20 09:30:00'),\n  (9,  'Frank Muller',  'DE', 'USB-C Hub',        'Hardware', 4,  49.99, 'delivered',  '2026-01-05 16:00:00'),\n  (10, 'Alice Martin',  'FR', 'Webcam HD',        'Video',    1,  89.99, 'shipped',    '2026-01-10 11:20:00'),\n  (11, 'Grace Okonkwo', 'NG', 'Mechanical Mouse', 'Hardware', 2,  79.95, 'processing', '2026-01-14 08:45:00'),\n  (12, 'Dan Okeke',     'NG', 'Pro Keyboard',     'Hardware', 1, 129.99, 'cancelled',  '2026-01-18 12:00:00'),\n  (13, 'Eve Nakamura',  'JP', 'HDMI 4K Cable',    'Cables',  10,  18.00, 'delivered',  '2026-01-22 15:30:00'),\n  (14, 'Frank Muller',  'DE', 'Noise Cancelling', 'Audio',    2, 299.00, 'shipped',    '2026-02-01 09:10:00'),\n  (15, 'Grace Okonkwo', 'NG', 'Webcam HD',        'Video',    3,  89.99, 'delivered',  '2026-02-07 14:00:00'),\n  (16, 'Bob Chen',      'US', 'Pro Keyboard',     'Hardware', 2, 129.99, 'delivered',  '2026-02-12 10:35:00'),\n  (17, 'Alice Martin',  'FR', 'USB-C Hub',        'Hardware', 3,  49.99, 'pending',    '2026-02-18 08:00:00'),\n  (18, 'Cora Silva',    'BR', 'HDMI 4K Cable',    'Cables',   8,  18.00, 'delivered',  '2026-02-25 17:20:00'),\n  (19, 'Frank Muller',  'DE', 'Mechanical Mouse', 'Hardware', 1,  79.95, 'pending',    '2026-03-02 11:05:00'),\n  (20, 'Eve Nakamura',  'JP', 'Noise Cancelling', 'Audio',    1, 299.00, 'shipped',    '2026-03-08 13:45:00');`)">②
+                                Seed 20 orders</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  category,\n  COUNT(*)                          AS orders,\n  SUM(qty)                          AS units_sold,\n  ROUND(SUM(qty * unit_price), 2)   AS revenue,\n  ROUND(AVG(unit_price), 2)         AS avg_price\nFROM orders\nGROUP BY category\nORDER BY revenue DESC;`)">Revenue
+                                by category</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  customer,\n  country,\n  COUNT(*)                          AS order_count,\n  SUM(qty)                          AS total_units,\n  ROUND(SUM(qty * unit_price), 2)   AS total_spent\nFROM orders\nWHERE status != 'cancelled'\nGROUP BY customer, country\nORDER BY total_spent DESC\nLIMIT 5;`)">Top
+                                5 customers</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  strftime('%Y-%m', placed_at)      AS month,\n  COUNT(*)                          AS orders,\n  COUNT(DISTINCT customer)          AS customers,\n  ROUND(SUM(qty * unit_price), 2)   AS revenue\nFROM orders\nGROUP BY month\nORDER BY month;`)">Monthly
+                                trend</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  placed_at,\n  customer,\n  product,\n  ROUND(qty * unit_price, 2)        AS order_value,\n  ROUND(SUM(qty * unit_price) OVER (\n    ORDER BY placed_at\n    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\n  ), 2)                             AS running_total\nFROM orders\nORDER BY placed_at;`)">Running
+                                total (window fn)</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT\n  status,\n  COUNT(*)                          AS count,\n  ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct,\n  ROUND(SUM(qty * unit_price), 2)   AS revenue\nFROM orders\nGROUP BY status\nORDER BY count DESC;`)">Status
+                                breakdown</button></li>
+                        <li><button
+                                onclick="setSQL(`WITH delivered_totals AS (\n  SELECT customer,\n         ROUND(SUM(qty * unit_price), 2) AS lifetime_value\n  FROM   orders\n  WHERE  status = 'delivered'\n  GROUP  BY customer\n)\nSELECT\n  o.customer, o.country, o.product,\n  o.status,   dt.lifetime_value\nFROM  orders o\nJOIN  delivered_totals dt ON dt.customer = o.customer\nWHERE o.status IN ('pending', 'processing')\nORDER BY dt.lifetime_value DESC, o.placed_at;`)">CTE:
+                                pending + lifetime value</button></li>
+                        <li><button
+                                onclick="setSQL(`SELECT id, customer, country, product, category,\n       qty, unit_price,\n       ROUND(qty * unit_price, 2) AS total,\n       status, placed_at\nFROM   orders\nORDER  BY placed_at DESC`); runPaginatedQuery(1)">Paginate
+                                all orders ⊞</button></li>
+                        <li><button onclick="setSQL('DROP TABLE IF EXISTS orders;')">⚠ Drop orders table</button></li>
+                    </ul>
+                </div>
+            </details>
+
+        </aside>
+
+        <!-- ── Workspace ── -->
+        <div class="workspace" id="workspace">
+
+            <!-- Editor pane -->
+            <div class="pane">
+                <div class="pane-bar">
+                    <span class="pane-label">SQL Editor</span>
+                    <span class="kbd-hint">⌘↵ run</span>
+                    <button class="btn-secondary" id="paginate-btn"
+                        onclick="runPaginatedQuery(1)">⊞&nbsp;Paginate</button>
+                    <button class="btn-primary" id="run-btn" onclick="runQuery()">▶&nbsp;Run</button>
+                </div>
+                <textarea id="sql-editor" spellcheck="false">SELECT sqlite_version();</textarea>
+            </div>
+
+            <!-- Resize handle -->
+            <div class="resize-handle" id="resize-handle"></div>
+
+            <!-- Results pane -->
+            <div class="pane results-pane">
+                <div class="pane-bar">
+                    <span id="timing-text"></span>
+                    <span class="pane-label">Results</span>
+                    <span id="result-meta"></span>
+                    <button class="btn-ghost" id="csv-btn" onclick="downloadCsv()" disabled
+                        style="margin-left:auto">&#8595;&nbsp;CSV</button>
+                </div>
+                <div class="pagination-bar" id="pagination-bar" style="display:none">
+                    <button id="prev-btn" onclick="goPage(-1)" disabled>&#8592; Prev</button>
+                    <span id="page-info">Page 1 of 1</span>
+                    <button id="next-btn" onclick="goPage(1)">Next &#8594;</button>
+                    <div class="page-size-wrap">
+                        <span>Rows</span>
+                        <input id="page-size-input" type="number" min="1" max="1000" value="5"
+                            onchange="rerunPaginated()" />
+                    </div>
+                </div>
+                <div class="results-body" id="results-body">
+                    <div class="log"><span class="info">Ready — configure a connection and run a query.</span></div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <footer>
+        <span>Hrana Console</span>
+        <span>HTTP &amp; WebSocket</span>
+        <span>v3 ready</span>
+    </footer>
+
+    <script src="dist/hrana.bundle.js"></script>
+    <script>
+        // ── Resize handle ──────────────────────────────────────────────────────────────
+
+        const resizeHandle = document.getElementById('resize-handle')
+        const workspace = document.getElementById('workspace')
+        let _dragging = false
+
+        resizeHandle.addEventListener('mousedown', e => {
+            _dragging = true
+            resizeHandle.classList.add('dragging')
+            e.preventDefault()
+        })
+        document.addEventListener('mousemove', e => {
+            if (!_dragging) return
+            const rect = workspace.getBoundingClientRect()
+            const pct = ((e.clientY - rect.top) / rect.height) * 100
+            workspace.style.gridTemplateRows = `${Math.min(80, Math.max(15, pct))}% 4px 1fr`
+        })
+        document.addEventListener('mouseup', () => {
+            _dragging = false
+            resizeHandle.classList.remove('dragging')
+        })
+
+        // ── Cache UI toggles ───────────────────────────────────────────────────────────
+
+        document.getElementById('cache-memory').addEventListener('change', function () {
+            document.getElementById('cache-ttl-row').style.display = this.checked ? 'flex' : 'none'
+        })
+        document.getElementById('cache-persist').addEventListener('change', function () {
+            document.getElementById('cache-group-row').style.display = this.checked ? 'flex' : 'none'
+        })
+
+        // ── PersistentCache (global, shared across client recreations) ─────────────────
+
+        let _persistentCache = null
+
+        Hrana.PersistentCache.open({ dbName: 'hrana_demo_cache', defaultTtl: 30 * 24 * 60 * 60 * 1000 })
+            .then(store => {
+                _persistentCache = store
+                Hrana.PersistentCache.purgeAllExpired() // throttled to once/day
+            })
+
+        function getCachePolicy() {
+            const mem = document.getElementById('cache-memory').checked
+            const pers = document.getElementById('cache-persist').checked
+            if (!mem && !pers) return undefined
+            const ttl = parseInt(document.getElementById('cache-ttl').value, 10) || 60_000
+            const group = document.getElementById('cache-group').value.trim() || undefined
+            if (pers) return { persist: true, ttl, group }
+            return { ttl }
+        }
+
+        function updateCacheSize() {
+            if (!_db) return
+            const n = _db.cache.size
+            document.getElementById('cache-size-text').textContent =
+                n > 0 ? `⚡ ${n} cached` : ''
+        }
+
+        async function clearMemoryCache() {
+            if (_db) { _db.cache.clear(); updateCacheSize() }
+            showLog('<span class="ok">&#10003; Memory cache cleared.</span>')
+        }
+
+        async function clearPersistentCache() {
+            if (!_persistentCache) { showLog('<span class="info">IndexedDB not yet initialised.</span>'); return }
+            await _persistentCache.clear()
+            showLog('<span class="ok">&#10003; IndexedDB cache cleared.</span>')
+        }
+
+        async function inspectPersistentCache() {
+            if (!_persistentCache) { showLog('<span class="info">IndexedDB not yet initialised.</span>'); return }
+            const info = await _persistentCache.inspect()
+            const groupLines = Object.entries(info.groups)
+                .map(([g, n]) => `&nbsp;&nbsp;${escHtml(g)}: ${n}`).join('<br>')
+            const kb = (info.estimatedBytes / 1024).toFixed(1)
+            showLog(
+                `<span class="ok">&#10003; IndexedDB inspect</span><br>` +
+                `<span class="info">Entries: ${info.totalEntries} &nbsp;·&nbsp; Est. ${kb} KB</span><br>` +
+                (groupLines ? `<span class="info">Groups:<br>${groupLines}</span><br>` : '') +
+                (info.oldestEntry ? `<span class="info">Oldest: ${info.oldestEntry.toLocaleString()}</span><br>` : '') +
+                (info.newestEntry ? `<span class="info">Newest: ${info.newestEntry.toLocaleString()}</span>` : '')
+            )
+        }
+
+        // ── localStorage URL persistence ───────────────────────────────────────────────
+
+        const LS_URL_KEY = 'hrana_console_url'
+        const urlInput = document.getElementById('url-input')
+        const savedUrl = localStorage.getItem(LS_URL_KEY)
+        if (savedUrl) urlInput.value = savedUrl
+        urlInput.addEventListener('input', () => localStorage.setItem(LS_URL_KEY, urlInput.value.trim()))
+
+        // ── Client (kept alive for WebSocket reuse) ────────────────────────────────────
+
+        let _db = null
+        let _connKey = ''
+
+        function getClient() {
+            const url = document.getElementById('url-input').value.trim()
+            const token = document.getElementById('token-input').value.trim()
+            const version = document.getElementById('version-select').value
+            const key = `${url}|${token}|${version}`
+
+            if (_db && key === _connKey) return _db
+            if (_db) _db.close().catch(() => undefined)
+
+            _db = new Hrana.HranaClient({
+                url,
+                authToken: token || undefined,
+                version,
+                persistentCache: _persistentCache || undefined,
+                cache: { ttl: 60_000, maxSize: 200 },
+            })
+            _connKey = key
+            return _db
+        }
+
+        ;['url-input', 'token-input', 'version-select'].forEach(id => {
+            document.getElementById(id).addEventListener('input', () => {
+                if (_db) { _db.close().catch(() => undefined); _db = null; _connKey = '' }
+                setStatus('', 'Not connected')
+            })
+        })
+
+        // ── UI helpers ─────────────────────────────────────────────────────────────────
+
+        function setSQL(sql) {
+            document.getElementById('sql-editor').value = sql
+        }
+
+        function setStatus(state, text) {
+            document.getElementById('status-dot').className = state
+            document.getElementById('status-text').textContent = text
+        }
+
+        function setMeta(html) {
+            document.getElementById('result-meta').innerHTML = html
+        }
+
+        function setTiming(text) {
+            document.getElementById('timing-text').textContent = text
+        }
+
+        function showLog(html) {
+            document.getElementById('results-body').innerHTML = `<div class="log">${html}</div>`
+        }
+
+        function showError(msg) {
+            showLog(`<span class="error">&#9888;&nbsp;${escHtml(msg)}</span>`)
+            setStatus('error', 'Error')
+        }
+
+        function escHtml(s) {
+            return String(s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+        }
+
+        // ── Value & table rendering ────────────────────────────────────────────────────
+
+        function renderValue(v) {
+            if (v === null) return `<span class="null-val">NULL</span>`
+            if (typeof v === 'bigint') return `<span class="int-val">${v}</span>`
+            if (typeof v === 'number') return `<span class="float-val">${v}</span>`
+            if (v instanceof Uint8Array) return `<span class="blob-val">blob(${v.length})</span>`
+            return escHtml(String(v))
+        }
+
+        function renderTable(result) {
+            const cols = result.columns
+
+            if (result.rows.length === 0) {
+                if (cols.length > 0) {
+                    const head = cols.map(c => `<th>${escHtml(c)}</th>`).join('')
+                    return `<table><thead><tr>${head}</tr></thead><tbody></tbody></table>` +
+                        `<div class="log" style="margin-top:.75rem"><span class="info">0 rows returned.</span></div>`
+                }
+                const parts = [`<span class="ok">&#10003;&nbsp;Done.</span>`]
+                if (result.rowsAffected > 0)
+                    parts.push(`<span class="info"> ${result.rowsAffected} row(s) affected.</span>`)
+                if (result.lastInsertRowid !== null)
+                    parts.push(`<span class="info"> Last insert rowid: ${result.lastInsertRowid}</span>`)
+                return `<div class="log">${parts.join('')}</div>`
+            }
+
+            const head = cols.map(c => `<th>${escHtml(c)}</th>`).join('')
+            const body = result.rows.map(row =>
+                `<tr>${cols.map(c => `<td>${renderValue(row[c])}</td>`).join('')}</tr>`
+            ).join('')
+            return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+        }
+
+        // ── Pagination state ───────────────────────────────────────────────────────────
+
+        let _lastResult = null
+        let _pageState = null
+
+        function downloadCsv() {
+            if (!_lastResult) return
+            const csv = Hrana.resultSetToCsv(_lastResult)
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = 'result.csv'
+            a.click()
+            URL.revokeObjectURL(url)
+        }
+
+        async function runPaginatedQuery(page) {
+            const sql = document.getElementById('sql-editor').value.trim()
+            if (!sql) return
+            const pageSize = parseInt(document.getElementById('page-size-input').value, 10) || 5
+            _pageState = { sql, page, pageSize }
+            await _executePaginated()
+        }
+
+        async function rerunPaginated() {
+            if (!_pageState) return
+            const pageSize = parseInt(document.getElementById('page-size-input').value, 10) || 5
+            _pageState = { ..._pageState, page: 1, pageSize }
+            await _executePaginated()
+        }
+
+        function goPage(delta) {
+            if (!_pageState) return
+            _pageState = { ..._pageState, page: _pageState.page + delta }
+            _executePaginated()
+        }
+
+        async function _executePaginated() {
+            const { sql, page, pageSize } = _pageState
+            const btn = document.getElementById('paginate-btn')
+            btn.disabled = true
+            setMeta('')
+            setTiming('')
+            showLog('<span class="info">Running…</span>')
+            setStatus('', 'Connecting…')
+
+            const db = getClient()
+            const t0 = performance.now()
+
+            try {
+                const cachePolicy = getCachePolicy()
+                const result = await db.paginate(sql, undefined, { page, pageSize, cache: cachePolicy })
+                const elapsed = (performance.now() - t0).toFixed(1)
+                const cached = result.fromCache === true
+                _lastResult = result
+                document.getElementById('csv-btn').disabled = false
+
+                document.getElementById('results-body').innerHTML = renderTable(result)
+                setMeta(
+                    `${result.rows.length} of ${result.totalRows} rows &nbsp;·&nbsp; page ${result.page}/${result.totalPages}` +
+                    (cached ? ' <span class="cache-badge">cached</span>' : '')
+                )
+                setTiming(`${elapsed} ms`)
+                setStatus('connected', `${document.getElementById('url-input').value.trim()}`)
+
+                document.getElementById('pagination-bar').style.display = 'flex'
+                document.getElementById('page-info').textContent = `Page ${result.page} of ${result.totalPages}`
+                document.getElementById('prev-btn').disabled = !result.hasPrevPage
+                document.getElementById('next-btn').disabled = !result.hasNextPage
+                document.getElementById('page-size-input').value = pageSize
+                _pageState = { sql, page: result.page, pageSize }
+                updateCacheSize()
+            } catch (err) {
+                if (_db) { _db.close().catch(() => undefined); _db = null; _connKey = '' }
+                showError(err instanceof Error ? err.message : String(err))
+                document.getElementById('pagination-bar').style.display = 'none'
+                _lastResult = null
+                document.getElementById('csv-btn').disabled = true
+                _pageState = null
+            } finally {
+                btn.disabled = false
+            }
+        }
+
+        // ── Run query ──────────────────────────────────────────────────────────────────
+
+        async function runQuery() {
+            const sql = document.getElementById('sql-editor').value.trim()
+            if (!sql) return
+
+            _pageState = null
+            document.getElementById('pagination-bar').style.display = 'none'
+
+            const btn = document.getElementById('run-btn')
+            btn.disabled = true
+            setMeta('')
+            setTiming('')
+            showLog('<span class="info">Running…</span>')
+            setStatus('', 'Connecting…')
+
+            const db = getClient()
+            const t0 = performance.now()
+
+            try {
+                const cachePolicy = getCachePolicy()
+                const result = await db.execute(sql, undefined, { cache: cachePolicy })
+                const elapsed = (performance.now() - t0).toFixed(1)
+                const cached = result.fromCache === true
+                _lastResult = result
+                document.getElementById('csv-btn').disabled = false
+
+                document.getElementById('results-body').innerHTML = renderTable(result)
+                setMeta(
+                    `${result.rows.length} row(s)` +
+                    (cached ? ' <span class="cache-badge">cached</span>' : '')
+                )
+                setTiming(`${elapsed} ms`)
+                setStatus('connected', `${document.getElementById('url-input').value.trim()}`)
+                updateCacheSize()
+            } catch (err) {
+                if (_db) { _db.close().catch(() => undefined); _db = null; _connKey = '' }
+                _lastResult = null
+                document.getElementById('csv-btn').disabled = true
+                showError(err instanceof Error ? err.message : String(err))
+            } finally {
+                btn.disabled = false
+            }
+        }
+
+        // ── Keyboard shortcut ──────────────────────────────────────────────────────────
+
+        document.getElementById('sql-editor').addEventListener('keydown', e => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault()
+                runQuery()
+            }
+        })
+    </script>
+</body>
+
+</html>

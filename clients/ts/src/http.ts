@@ -3,14 +3,19 @@ import { HranaError } from "./client"
 
 export class HttpStream {
     readonly #baseUrl: string
-    readonly #authToken: string | undefined
     readonly #version: "v2" | "v3"
+
+    #authToken: string | undefined
     #baton: string | null = null
 
     constructor(baseUrl: string, version: "v2" | "v3", authToken?: string) {
         this.#baseUrl = baseUrl.replace(/\/$/, "")
         this.#version = version
         this.#authToken = authToken
+    }
+
+    authToken(token: string | undefined) {
+        this.#authToken = token
     }
 
     async execute(stmt: WireStmt): Promise<WireStmtResult> {

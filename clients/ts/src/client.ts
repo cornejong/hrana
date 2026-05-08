@@ -222,6 +222,11 @@ export class HranaClient {
         this.#validateConfig()
     }
 
+    authToken(token: string) {
+        this.#cfg.authToken = token
+        this.#getTransport().authToken(token)
+    }
+
     /**
      * Execute a SQL statement and return a decoded ResultSet.
      * Parameters can be positional (array) or named (object).

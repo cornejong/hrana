@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 // executeStmt translates a Hrana Stmt into a database/sql call and returns the

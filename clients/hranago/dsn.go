@@ -7,10 +7,11 @@ import (
 )
 
 type config struct {
-	baseURL    string
-	authToken  string
-	apiVersion string // "v1", "v2", or "v3"
-	transport  string // "http" or "ws"
+	baseURL               string
+	authToken             string
+	apiVersion            string // "v1", "v2", or "v3"
+	transport             string // "http" or "ws"
+	dynamicContainerDBIds []string
 }
 
 // parseDSN parses a Hrana DSN URL into a config.

@@ -21,19 +21,21 @@ type stmtExecutor interface {
 // database/sql guarantees a Conn is used by only one goroutine at a time,
 // but we hold a mutex around baton access for safety during Close.
 type conn struct {
-	cfg        *config
-	httpClient *http.Client
-	mu         sync.Mutex
-	baton      *string // nil until first request; rotates on every pipeline call
-	baseURL    string  // may be updated by base_url in pipeline responses
-	closed     bool
+	cfg              *config
+	httpClient       *http.Client
+	wsConnectHeaders http.Header
+	mu               sync.Mutex
+	baton            *string // nil until first request; rotates on every pipeline call
+	baseURL          string  // may be updated by base_url in pipeline responses
+	closed           bool
 }
 
 func newConn(cfg *config) *conn {
 	return &conn{
-		cfg:        cfg,
-		httpClient: &http.Client{},
-		baseURL:    cfg.baseURL,
+		cfg:              cfg,
+		httpClient:       &http.Client{},
+		wsConnectHeaders: make(http.Header),
+		baseURL:          cfg.baseURL,
 	}
 }
 

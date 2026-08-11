@@ -2,11 +2,15 @@ package hrana
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 )
+
+var ErrEncodingNotSupported = errors.New("encoding not supported")
+var ErrAsymmetricalEncoding = errors.New("request and response encodings must match")
 
 // ServeHTTP routes incoming HTTP requests to the appropriate Hrana handler.
 // If the request is a WebSocket upgrade it is handled as a Hrana WebSocket
@@ -63,8 +67,14 @@ func (s *Server) handleV1Execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	codec, err := selectCodecFromRequest(r)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotAcceptable, err.Error())
+		return
+	}
+
 	var body V1ExecuteReqBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := codec.DecodeReader(r.Body, &body); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -83,7 +93,8 @@ func (s *Server) handleV1Execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.httpLog.Debug("http v1 execute ok", slog.Uint64("rows_affected", result.AffectedRowCount), slog.Float64("duration_ms", result.QueryDurationMs))
-	writeJSON(w, http.StatusOK, V1ExecuteRespBody{Result: *result})
+	writeCodec(w, codec, http.StatusOK, V1ExecuteRespBody{Result: *result})
+	// writeCodec(w, codec,http.StatusOK, V1ExecuteRespBody{Result: *result})
 }
 
 func (s *Server) handleV1Batch(w http.ResponseWriter, r *http.Request) {
@@ -98,8 +109,14 @@ func (s *Server) handleV1Batch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	codec, err := selectCodecFromRequest(r)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotAcceptable, err.Error())
+		return
+	}
+
 	var body V1BatchReqBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := codec.DecodeReader(r.Body, &body); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -118,7 +135,7 @@ func (s *Server) handleV1Batch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.httpLog.Debug("http v1 batch ok", slog.Int("steps", len(result.StepResults)))
-	writeJSON(w, http.StatusOK, V1BatchRespBody{Result: *result})
+	writeCodec(w, codec, http.StatusOK, V1BatchRespBody{Result: *result})
 }
 
 // ─── V2/V3 pipeline handler ──────────────────────────────────────────────────
@@ -135,8 +152,14 @@ func (s *Server) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	codec, err := selectCodecFromRequest(r)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotAcceptable, err.Error())
+		return
+	}
+
 	var body PipelineReqBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := codec.DecodeReader(r.Body, &body); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -186,7 +209,7 @@ func (s *Server) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, PipelineRespBody{
+	writeCodec(w, codec, http.StatusOK, PipelineRespBody{
 		Baton:   newBaton,
 		BaseURL: nil,
 		Results: results,
@@ -333,8 +356,14 @@ func (s *Server) handleV3Cursor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	codec, err := selectCodecFromRequest(r)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotAcceptable, err.Error())
+		return
+	}
+
 	var body CursorReqBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := codec.DecodeReader(r.Body, &body); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -370,14 +399,14 @@ func (s *Server) handleV3Cursor(w http.ResponseWriter, r *http.Request) {
 	newBaton := &baton
 
 	// Set streaming headers.
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", codec.ContentType())
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 
-	enc := json.NewEncoder(w)
-
 	// First line: CursorRespBody
-	if err := enc.Encode(CursorRespBody{Baton: newBaton, BaseURL: nil}); err != nil {
+
+	if err := codec.EncodeWriter(w, CursorRespBody{Baton: newBaton, BaseURL: nil}); err != nil {
+		// if err := enc.Encode(CursorRespBody{Baton: newBaton, BaseURL: nil}); err != nil {
 		return
 	}
 	flushIfPossible(w)
@@ -387,13 +416,14 @@ func (s *Server) handleV3Cursor(w http.ResponseWriter, r *http.Request) {
 	stream.Unlock()
 
 	if execErr != nil {
-		_ = enc.Encode(CursorEntry{Type: "error", Error: &Error{Message: execErr.Error()}})
+
+		_ = codec.EncodeWriter(w, CursorEntry{Type: "error", Error: &Error{Message: execErr.Error()}})
 		flushIfPossible(w)
 		return
 	}
 
 	for _, entry := range entries {
-		if err := enc.Encode(entry); err != nil {
+		if err := codec.EncodeWriter(w, entry); err != nil {
 			return
 		}
 		flushIfPossible(w)
@@ -468,6 +498,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeCodec(w http.ResponseWriter, codec Codec, status int, v any) {
+	w.Header().Set("Content-Type", codec.ContentType())
+	w.WriteHeader(status)
+	encoded, _ := codec.Encode(v)
+	w.Write(encoded)
+}
+
 func writeHTTPError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, Error{Message: msg})
 }
@@ -475,4 +512,33 @@ func writeHTTPError(w http.ResponseWriter, status int, msg string) {
 func errorStreamResult(msg string) StreamResult {
 	e := &Error{Message: msg}
 	return StreamResult{Type: "error", Error: e}
+}
+
+func selectCodecFromRequest(r *http.Request) (Codec, error) {
+	contentType := mediaType(r.Header.Get("Content-Type"))
+	accept := mediaType(r.Header.Get("Accept"))
+
+	if accept == "" || accept == "*/*" {
+		accept = contentType
+	}
+
+	if contentType != accept {
+		return nil, ErrAsymmetricalEncoding
+	}
+
+	switch contentType {
+	case "application/json":
+		return JSONCodec{}, nil
+	case "application/msgpack", "application/x-msgpack":
+		return MsgpackCodec{}, nil
+	default:
+		return nil, ErrEncodingNotSupported
+	}
+}
+
+func mediaType(v string) string {
+	if i := strings.IndexByte(v, ';'); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
 }

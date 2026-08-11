@@ -2,6 +2,12 @@ module github.com/cornejong/hrana
 
 go 1.25.6
 
-require github.com/mattn/go-sqlite3 v1.14.42
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/vmihailenco/msgpack/v5 v5.4.1
+)
 
-require github.com/gorilla/websocket v1.5.3 // indirect
+require (
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	lowbit.dev/cooper v0.2.0 // indirect
+)

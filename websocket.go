@@ -28,11 +28,13 @@ func (s *Server) ServeConn(conn net.Conn) {
 		return
 	}
 
-	proto := s.negotiateSubprotocol(req.header("Sec-Websocket-Protocol"))
+	proto, codec := s.negotiateSubprotocol(req.header("Sec-Websocket-Protocol"))
 	if proto == "" {
 		writeRawHTTP(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
+
+	_ = codec
 
 	mode, err := parseMode(req.queryParam("mode"))
 	if err != nil {
@@ -62,11 +64,13 @@ func (s *Server) serveWSUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proto := s.negotiateSubprotocol(r.Header.Get("Sec-WebSocket-Protocol"))
+	proto, codec := s.negotiateSubprotocol(r.Header.Get("Sec-WebSocket-Protocol"))
 	if proto == "" {
 		http.Error(w, "no supported Hrana subprotocol", http.StatusBadRequest)
 		return
 	}
+
+	_ = codec
 
 	mode, err := parseMode(r.URL.Query().Get("mode"))
 	if err != nil {
@@ -610,7 +614,7 @@ func readFull(r *bufio.Reader, buf []byte) (int, error) {
 }
 
 // negotiateSubprotocol picks the highest enabled Hrana version that the client offered.
-func (s *Server) negotiateSubprotocol(offered string) string {
+func (s *Server) negotiateSubprotocol(offered string) (string, Codec) {
 	for _, preferred := range []string{"hrana3", "hrana2", "hrana1"} {
 		// Map "hranaX" to "vX" for the version-enabled check.
 		if !s.isVersionEnabled("v" + preferred[len("hrana"):]) {
@@ -618,11 +622,12 @@ func (s *Server) negotiateSubprotocol(offered string) string {
 		}
 		for _, o := range splitAndTrim(offered, ",") {
 			if o == preferred {
-				return preferred
+				return preferred, DefaultCodec
 			}
 		}
 	}
-	return ""
+
+	return "", DefaultCodec
 }
 
 func splitAndTrim(s, sep string) []string {

@@ -2,14 +2,18 @@ package hrana
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
+	"lowbit.dev/websockets"
 )
 
 // ServeConn performs the WebSocket handshake on a raw TCP connection and then
@@ -21,14 +25,17 @@ func (s *Server) ServeConn(conn net.Conn) {
 		writeRawHTTP(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
-	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
-	req, err := readHTTPRequest(brw.Reader)
+	// bufio.Reader is used only to parse the HTTP upgrade headers. WebSocket
+	// clients do not send frame data before receiving the 101 response, so the
+	// read buffer will be empty before we hand the raw conn to the WS package.
+	brdr := bufio.NewReader(conn)
+	req, err := readHTTPRequest(brdr)
 	if err != nil {
 		return
 	}
 
-	proto := s.negotiateSubprotocol(req.header("Sec-Websocket-Protocol"))
+	proto := matchSubprotocol(s.enabledSubprotocols(), req.header("sec-websocket-protocol"))
 	if proto == "" {
 		writeRawHTTP(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
 		return
@@ -40,31 +47,29 @@ func (s *Server) ServeConn(conn net.Conn) {
 		return
 	}
 
-	key := req.header("Sec-Websocket-Key")
-	if err := writeWSHandshake(conn, key, proto); err != nil {
-		return
-	}
+	accept := wsAccept(req.header("sec-websocket-key"))
+	writeRawHTTP(conn,
+		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: "+accept+"\r\n"+
+			"Sec-WebSocket-Protocol: "+proto+"\r\n\r\n")
 
-	s.runWSSession(conn, brw.Reader, proto, mode)
+	wsConn := s.wsConnPool.Acquire(conn, websockets.ReadLimitStandard, websockets.FrameSizeBalanced)
+	wsConn.AssumeServerRole()
+	wsConn.SetSubprotocol(proto)
+	defer s.wsConnPool.Release(wsConn)
+	defer wsConn.Close()
+
+	s.runWSSession(wsConn, proto, mode, conn.RemoteAddr().String())
 }
 
 // serveWSUpgrade handles a WebSocket upgrade that arrived via ServeHTTP.
-// The http.Request has already been parsed by net/http, so we hijack the
-// connection, write the 101 handshake, and enter the session loop.
+// The Acceptor performs validation, subprotocol negotiation, hijacking, and
+// the 101 handshake, returning a ready-to-use Connection.
 func (s *Server) serveWSUpgrade(w http.ResponseWriter, r *http.Request) {
 	if s.closing.Load() {
 		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "websocket upgrade not supported", http.StatusInternalServerError)
-		return
-	}
-
-	proto := s.negotiateSubprotocol(r.Header.Get("Sec-WebSocket-Protocol"))
-	if proto == "" {
-		http.Error(w, "no supported Hrana subprotocol", http.StatusBadRequest)
 		return
 	}
 
@@ -74,36 +79,78 @@ func (s *Server) serveWSUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, brw, err := hj.Hijack()
+	wsConn, err := s.wsAcceptor.Accept(w, r)
 	if err != nil {
-		http.Error(w, "hijack failed", http.StatusInternalServerError)
-		return
+		return // Acceptor has already written the HTTP error response.
 	}
-	defer conn.Close()
+	defer s.wsAcceptor.Release(wsConn)
+	defer wsConn.Close()
 
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if err := writeWSHandshake(conn, key, proto); err != nil {
-		return
-	}
-
-	s.runWSSession(conn, brw.Reader, proto, mode)
+	s.runWSSession(wsConn, wsConn.Subprotocol(), mode, r.RemoteAddr)
 }
 
-// runWSSession is the shared Hrana WebSocket message loop. It is entered after
-// the HTTP 101 handshake has already been written to conn.
-func (s *Server) runWSSession(conn net.Conn, r *bufio.Reader, proto string, mode ConnectionMode) {
-	remoteAddr := conn.RemoteAddr().String()
+// ─── Codec helpers ───────────────────────────────────────────────────────────
+
+// codecForProto returns the Codec and WebSocket frame opcode for a given
+// subprotocol. The "-bin" variants use MsgpackCodec over binary frames;
+// all others use JSONCodec over text frames.
+func codecForProto(proto string) (Codec, websockets.OpCode) {
+	if strings.HasSuffix(proto, "-bin") {
+		return MsgpackCodec{}, websockets.OpCodeBinary
+	}
+	return JSONCodec{}, websockets.OpCodeText
+}
+
+// extractWSRequest pulls the request_id and raw inner request bytes from the
+// full WS message payload using the session's codec.
+//
+// For msgpack we decode Request into any and immediately re-marshal it. This
+// is necessary because msgpack.RawMessage.DecodeMsgpack does not preserve the
+// outer type-prefix byte, so the captured bytes are not a valid standalone
+// msgpack document that can be Unmarshal-ed on their own.
+func extractWSRequest(payload []byte, codec Codec) (int32, []byte, error) {
+	switch codec.(type) {
+	case JSONCodec:
+		var env RequestMsg
+		if err := json.Unmarshal(payload, &env); err != nil {
+			return 0, nil, err
+		}
+		return env.RequestID, env.Request, nil
+	case MsgpackCodec:
+		var env struct {
+			Type      string `msgpack:"type"`
+			RequestID int32  `msgpack:"request_id"`
+			Request   any    `msgpack:"request"`
+		}
+		if err := msgpack.Unmarshal(payload, &env); err != nil {
+			return 0, nil, err
+		}
+		// Re-marshal the decoded inner value so dispatchWSRequest receives a
+		// self-contained msgpack document it can Unmarshal independently.
+		inner, err := msgpack.Marshal(env.Request)
+		if err != nil {
+			return 0, nil, err
+		}
+		return env.RequestID, inner, nil
+	default:
+		return 0, nil, fmt.Errorf("hrana: unsupported codec type")
+	}
+}
+
+// runWSSession is the shared Hrana WebSocket message loop entered after the
+// 101 handshake has been completed and a Connection is ready.
+func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode ConnectionMode, remoteAddr string) {
 	s.wsLog.Debug("ws session started", slog.String("remote", remoteAddr), slog.String("proto", proto))
 
 	s.wsMu.Lock()
-	s.wsConns[conn] = struct{}{}
+	s.wsConns[wsConn] = struct{}{}
 	s.wsMu.Unlock()
 
 	s.wg.Add(1)
 	atomic.AddInt64(&s.wsConnCount, 1)
 	defer func() {
 		s.wsMu.Lock()
-		delete(s.wsConns, conn)
+		delete(s.wsConns, wsConn)
 		s.wsMu.Unlock()
 		s.wg.Done()
 		s.wsLog.Debug("ws session ended", slog.String("remote", remoteAddr), slog.String("proto", proto))
@@ -115,53 +162,71 @@ func (s *Server) runWSSession(conn net.Conn, r *bufio.Reader, proto string, mode
 	sess := newSession(mode)
 	defer sess.closeAll()
 
+	codec, opCode := codecForProto(proto)
 	authed := false
 
-	var writeMu sync.Mutex
+	// Reuse a single read buffer for the lifetime of the session to avoid
+	// per-message allocations. ReadMessage slices into this buffer directly.
+	readBuf := make([]byte, 0, websockets.ReadLimitStandard)
+
 	sendMsg := func(msg any) error {
-		data, err := json.Marshal(msg)
+		data, err := codec.Encode(msg)
 		if err != nil {
+			s.wsLog.Error("failed to encode payload", "error", err)
 			return err
 		}
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeWSTextFrame(conn, data)
+		if err := wsConn.StreamMessage(opCode, websockets.FrameSizeBalanced-12, bytes.NewReader(data)); err != nil {
+			s.wsLog.Error("failed to send message", "error", err)
+		}
+		return nil
 	}
 
 	for {
-		data, err := readWSTextFrame(r)
+		readBuf = readBuf[:0]
+		payload, op, err := wsConn.ReadMessage(readBuf)
 		if err != nil {
+			s.wsLog.Error("failed to read message", "error", err)
+			return
+		}
+		if op != opCode {
+			s.wsLog.Error("received unexpected frame opcode", "op", op, "expected", opCode)
 			return
 		}
 
 		var base struct {
-			Type string `json:"type"`
+			Type string `json:"type" msgpack:"type"`
 		}
-		if err := json.Unmarshal(data, &base); err != nil {
+		if err := codec.Decode(payload, &base); err != nil {
+			s.wsLog.Error("failed to decode message type", "error", err)
 			return
 		}
 
 		switch base.Type {
 		case "hello":
 			var msg HelloMsg
-			if err := json.Unmarshal(data, &msg); err != nil {
+			if err := codec.Decode(payload, &msg); err != nil {
+				s.wsLog.Error("Failed to decode payload for hello", "error", err)
 				return
 			}
+
 			token := ""
 			if msg.JWT != nil {
 				token = *msg.JWT
 			}
+
 			expiry, authErr := s.config.AuthFunc(token)
 			if authErr != nil {
 				s.wsLog.Debug("ws auth rejected", slog.String("remote", remoteAddr), slog.String("error", authErr.Error()))
 				_ = sendMsg(HelloErrorMsg{Type: "hello_error", Error: Error{Message: authErr.Error()}})
 				return
 			}
+
 			if expiry != nil {
-				_ = conn.SetReadDeadline(*expiry)
+				_ = wsConn.SetReadDeadline(*expiry)
 			} else {
-				_ = conn.SetReadDeadline(time.Time{})
+				_ = wsConn.SetReadDeadline(time.Time{})
 			}
+
 			s.wsLog.Debug("ws auth accepted", slog.String("remote", remoteAddr))
 			authed = true
 			_ = sendMsg(HelloOkMsg{Type: "hello_ok"})
@@ -173,29 +238,29 @@ func (s *Server) runWSSession(conn net.Conn, r *bufio.Reader, proto string, mode
 			if s.closing.Load() {
 				return
 			}
-			var reqMsg RequestMsg
-			if err := json.Unmarshal(data, &reqMsg); err != nil {
+			requestID, rawReq, err := extractWSRequest(payload, codec)
+			if err != nil {
 				return
 			}
 			s.wg.Add(1)
-			go func(rm RequestMsg) {
+			go func(id int32, raw []byte) {
 				defer s.wg.Done()
-				s.wsLog.Debug("ws request dispatched", slog.Int64("request_id", int64(rm.RequestID)), slog.String("remote", remoteAddr))
-				resp, respErr := s.dispatchWSRequest(rm, sess, proto)
+				s.wsLog.Debug("ws request dispatched", slog.Int64("request_id", int64(id)), slog.String("remote", remoteAddr))
+				resp, respErr := s.dispatchWSRequest(id, raw, codec, sess, proto)
 				if respErr != nil {
 					_ = sendMsg(ResponseErrorMsg{
 						Type:      "response_error",
-						RequestID: rm.RequestID,
+						RequestID: id,
 						Error:     Error{Message: respErr.Error()},
 					})
 					return
 				}
 				_ = sendMsg(ResponseOkMsg{
 					Type:      "response_ok",
-					RequestID: rm.RequestID,
+					RequestID: id,
 					Response:  resp,
 				})
-			}(reqMsg)
+			}(requestID, rawReq)
 
 		default:
 			return
@@ -204,55 +269,57 @@ func (s *Server) runWSSession(conn net.Conn, r *bufio.Reader, proto string, mode
 }
 
 // dispatchWSRequest routes a decoded WS request to the appropriate handler.
-func (s *Server) dispatchWSRequest(rm RequestMsg, sess *Session, proto string) (any, error) {
+// rawReq contains the raw bytes of the inner request object (not the full
+// envelope), encoded with the session's codec.
+func (s *Server) dispatchWSRequest(requestID int32, rawReq []byte, codec Codec, sess *Session, proto string) (any, error) {
 	var base struct {
-		Type string `json:"type"`
+		Type string `json:"type" msgpack:"type"`
 	}
-	if err := json.Unmarshal(rm.Request, &base); err != nil {
+	if err := codec.Decode(rawReq, &base); err != nil {
 		return nil, fmt.Errorf("hrana: invalid request payload")
 	}
 
-	s.wsLog.Debug("ws request type", slog.Int64("request_id", int64(rm.RequestID)), slog.String("type", base.Type))
+	s.wsLog.Debug("ws request type", slog.Int64("request_id", int64(requestID)), slog.String("type", base.Type))
 
 	switch base.Type {
 	case "open_stream":
 		var req OpenStreamReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsOpenStream(sess, req)
 
 	case "close_stream":
 		var req CloseStreamReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsCloseStream(sess, req)
 
 	case "execute":
 		var req ExecuteReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsExecute(sess, req)
 
 	case "batch":
 		var req BatchReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsBatch(sess, req)
 
 	case "store_sql":
 		var req StoreSqlReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsStoreSQL(sess, req)
 
 	case "close_sql":
 		var req CloseSqlReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		sess.closeSQL(req.SQLID)
@@ -260,45 +327,45 @@ func (s *Server) dispatchWSRequest(rm RequestMsg, sess *Session, proto string) (
 
 	case "sequence":
 		var req SequenceReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsSequence(sess, req)
 
 	case "describe":
 		var req DescribeReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsDescribe(sess, req)
 
 	case "get_autocommit":
 		var req GetAutocommitReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsGetAutocommit(sess, req)
 
 	case "open_cursor":
-		if proto != "hrana3" {
+		if proto != "hrana3" && proto != "hrana3-bin" {
 			return nil, fmt.Errorf("hrana: open_cursor requires hrana3")
 		}
 		var req OpenCursorReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsOpenCursor(sess, req)
 
 	case "close_cursor":
 		var req CloseCursorReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsCloseCursor(sess, req)
 
 	case "fetch_cursor":
 		var req FetchCursorReq
-		if err := json.Unmarshal(rm.Request, &req); err != nil {
+		if err := codec.Decode(rawReq, &req); err != nil {
 			return nil, err
 		}
 		return s.wsFetchCursor(sess, req)
@@ -465,196 +532,31 @@ func (s *Server) wsFetchCursor(sess *Session, req FetchCursorReq) (any, error) {
 	return FetchCursorResp{Type: "fetch_cursor", Entries: entries, Done: done}, nil
 }
 
-// closeAllWSConns sends a WebSocket close frame (1001 Going Away) to every
-// active WS connection and sets their read deadline to now so that blocked
-// readWSTextFrame calls return immediately.
-func (s *Server) closeAllWSConns(reason string) {
+// closeAllWSConns sends a WebSocket 1001 Going Away close frame to every active
+// connection. CloseWithCode closes the underlying TCP socket, which also
+// unblocks any pending ReadMessage calls in the session goroutines.
+func (s *Server) closeAllWSConns(_ string) {
 	s.wsMu.Lock()
-	conns := make([]net.Conn, 0, len(s.wsConns))
+	conns := make([]websockets.Connection, 0, len(s.wsConns))
 	for c := range s.wsConns {
 		conns = append(conns, c)
 	}
 	s.wsMu.Unlock()
 
 	for _, c := range conns {
-		_ = writeWSCloseFrame(c, 1001, reason)
-		_ = c.SetReadDeadline(time.Now())
+		_ = c.(*websockets.Conn).CloseWithCode(websockets.CloseGoingAway)
 	}
 }
 
-// writeWSCloseFrame sends a WebSocket close frame with the given status code
-// and reason string per RFC 6455 §5.5.1.
-func writeWSCloseFrame(conn net.Conn, code uint16, reason string) error {
-	payload := make([]byte, 2+len(reason))
-	payload[0] = byte(code >> 8)
-	payload[1] = byte(code)
-	copy(payload[2:], reason)
-
-	length := len(payload)
-	var header []byte
-	header = append(header, 0x88) // FIN=1, opcode=8 (close)
-	if length <= 125 {
-		header = append(header, byte(length))
-	} else {
-		header = append(header, 126, byte(length>>8), byte(length))
-	}
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	_, err := conn.Write(payload)
-	return err
-}
-
-// ─── Minimal WebSocket framing ────────────────────────────────────────────────
-
-func writeWSHandshake(conn net.Conn, key, proto string) error {
-	accept := wsAccept(key)
-	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n" +
-		"Sec-WebSocket-Protocol: " + proto + "\r\n\r\n"
-	_, err := fmt.Fprint(conn, resp)
-	return err
-}
-
-func writeWSTextFrame(conn net.Conn, payload []byte) error {
-	length := len(payload)
-	var header []byte
-	header = append(header, 0x81) // FIN=1, opcode=1 (text)
-	if length <= 125 {
-		header = append(header, byte(length))
-	} else if length <= 65535 {
-		header = append(header, 126, byte(length>>8), byte(length))
-	} else {
-		header = append(header, 127,
-			0, 0, 0, 0,
-			byte(length>>24), byte(length>>16), byte(length>>8), byte(length))
-	}
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	_, err := conn.Write(payload)
-	return err
-}
-
-func readWSTextFrame(r *bufio.Reader) ([]byte, error) {
-	var payload []byte
-	for {
-		b0, err := r.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		b1, err := r.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-
-		fin := b0&0x80 != 0
-		opcode := b0 & 0x0f
-		masked := b1&0x80 != 0
-		length := int(b1 & 0x7f)
-
-		if length == 126 {
-			buf := make([]byte, 2)
-			if _, err := readFull(r, buf); err != nil {
-				return nil, err
-			}
-			length = int(buf[0])<<8 | int(buf[1])
-		} else if length == 127 {
-			buf := make([]byte, 8)
-			if _, err := readFull(r, buf); err != nil {
-				return nil, err
-			}
-			length = int(buf[4])<<24 | int(buf[5])<<16 | int(buf[6])<<8 | int(buf[7])
-		}
-
-		var mask [4]byte
-		if masked {
-			if _, err := readFull(r, mask[:]); err != nil {
-				return nil, err
-			}
-		}
-
-		data := make([]byte, length)
-		if _, err := readFull(r, data); err != nil {
-			return nil, err
-		}
-		if masked {
-			for i := range data {
-				data[i] ^= mask[i%4]
-			}
-		}
-
-		if opcode == 8 {
-			return nil, fmt.Errorf("hrana: websocket closed by client")
-		}
-
-		payload = append(payload, data...)
-		if fin {
-			return payload, nil
-		}
-	}
-}
-
-func readFull(r *bufio.Reader, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := r.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-// negotiateSubprotocol picks the highest enabled Hrana version that the client offered.
-func (s *Server) negotiateSubprotocol(offered string) string {
-	for _, preferred := range []string{"hrana3", "hrana2", "hrana1"} {
-		// Map "hranaX" to "vX" for the version-enabled check.
-		if !s.isVersionEnabled("v" + preferred[len("hrana"):]) {
-			continue
-		}
-		for _, o := range splitAndTrim(offered, ",") {
-			if o == preferred {
-				return preferred
+// matchSubprotocol returns the first entry in serverProtos that the client
+// offered, preserving server-side priority order.
+func matchSubprotocol(serverProtos []string, clientHeader string) string {
+	for _, server := range serverProtos {
+		for _, offered := range strings.Split(clientHeader, ",") {
+			if strings.TrimSpace(offered) == server {
+				return server
 			}
 		}
 	}
 	return ""
-}
-
-func splitAndTrim(s, sep string) []string {
-	var out []string
-	for _, part := range splitString(s, sep) {
-		t := trimSpace(part)
-		if t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-func splitString(s, sep string) []string {
-	var parts []string
-	start := 0
-	for i := 0; i <= len(s)-len(sep); i++ {
-		if s[i:i+len(sep)] == sep {
-			parts = append(parts, s[start:i])
-			start = i + len(sep)
-		}
-	}
-	parts = append(parts, s[start:])
-	return parts
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

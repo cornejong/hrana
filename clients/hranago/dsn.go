@@ -11,6 +11,7 @@ type config struct {
 	authToken             string
 	apiVersion            string // "v1", "v2", or "v3"
 	transport             string // "http" or "ws"
+	codec                 Codec
 	dynamicContainerDBIds []string
 }
 
@@ -64,10 +65,19 @@ func parseDSN(dsn string) (*config, error) {
 	u.RawQuery = ""
 	baseURL := strings.TrimRight(u.String(), "/")
 
+	var codec Codec
+	switch q.Get("codec") {
+	case "msgpack":
+		codec = MsgpackCodec{}
+	default:
+		codec = JSONCodec{}
+	}
+
 	return &config{
 		baseURL:    baseURL,
 		authToken:  token,
 		apiVersion: version,
 		transport:  transport,
+		codec:      codec,
 	}, nil
 }

@@ -10,4 +10,5 @@ require (
 require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	lowbit.dev/cooper v0.2.0 // indirect
+	lowbit.dev/websockets v0.1.1 // indirect
 )

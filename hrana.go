@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"lowbit.dev/websockets"
 )
 
 // ConnectionMode controls which SQL operations a stream allows at the
@@ -72,6 +73,12 @@ type Config struct {
 	// requests (CORS). Use ["*"] to allow all origins. If nil or empty, no CORS
 	// headers are sent (same-origin only).
 	AllowOrigins []string
+
+	// WSConnPool is an optional shared WebSocket connection pool. When provided,
+	// the server uses it for both the HTTP upgrade path and the raw TCP path,
+	// allowing multiple Server instances to share a single pool of pre-allocated
+	// connection buffers. If nil, a pool is created automatically on New.
+	WSConnPool *websockets.ConnPool
 }
 
 // Server holds the Hrana server state.
@@ -86,7 +93,9 @@ type Server struct {
 	wsConnCount int64 // accessed atomically
 	closing     atomic.Bool
 	wsMu        sync.Mutex
-	wsConns     map[net.Conn]struct{}
+	wsConns     map[websockets.Connection]struct{}
+	wsConnPool  *websockets.ConnPool
+	wsAcceptor  *websockets.Acceptor
 	wg          sync.WaitGroup
 }
 
@@ -115,16 +124,28 @@ func New(db *sql.DB, conf *Config) *Server {
 
 	ctx, cancel := context.WithCancel(conf.ctx)
 
-	return &Server{
-		db:      db,
-		config:  conf,
-		httpLog: subLogger(base, "http"),
-		wsLog:   subLogger(base, "ws"),
-		batons:  newBatonStore(conf.BatonTTL),
-		ctx:     ctx,
-		cancel:  cancel,
-		wsConns: make(map[net.Conn]struct{}),
+	pool := conf.WSConnPool
+	if pool == nil {
+		pool = websockets.NewConnPool(websockets.ReadLimitStandard, websockets.FrameSizeBalanced)
 	}
+
+	s := &Server{
+		db:         db,
+		config:     conf,
+		httpLog:    subLogger(base, "http"),
+		wsLog:      subLogger(base, "ws"),
+		batons:     newBatonStore(conf.BatonTTL),
+		ctx:        ctx,
+		cancel:     cancel,
+		wsConns:    make(map[websockets.Connection]struct{}),
+		wsConnPool: pool,
+	}
+
+	acceptor := websockets.NewAcceptorWithConnPool(pool)
+	acceptor.Subprotocols = s.enabledSubprotocols()
+	s.wsAcceptor = acceptor
+
+	return s
 }
 
 // ActiveWSConnections returns the number of currently active WebSocket connections.
@@ -173,4 +194,33 @@ func (s *Server) isVersionEnabled(v string) bool {
 		}
 	}
 	return false
+}
+
+// enabledSubprotocols returns the Hrana WebSocket subprotocols the server supports,
+// ordered from highest to lowest preference. The Acceptor uses this list for negotiation.
+// Each Hrana version has a plain (JSON/text) and a -bin (Msgpack/binary) variant.
+func (s *Server) enabledSubprotocols() []string {
+	type entry struct {
+		proto string
+		ver   string
+	}
+	candidates := []entry{
+		{"hrana3", "v3"}, {"hrana3-bin", "v3"},
+		{"hrana2", "v2"}, {"hrana2-bin", "v2"},
+		{"hrana1", "v1"}, {"hrana1-bin", "v1"},
+	}
+	if len(s.config.Versions) == 0 {
+		out := make([]string, len(candidates))
+		for i, e := range candidates {
+			out[i] = e.proto
+		}
+		return out
+	}
+	out := make([]string, 0, len(candidates))
+	for _, e := range candidates {
+		if s.isVersionEnabled(e.ver) {
+			out = append(out, e.proto)
+		}
+	}
+	return out
 }

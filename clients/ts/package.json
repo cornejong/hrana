@@ -19,5 +19,8 @@
     "devDependencies": {
         "esbuild": "^0.28.0",
         "typescript": "^5.4.0"
+    },
+    "dependencies": {
+        "@msgpack/msgpack": "^3.0.0"
     }
 }

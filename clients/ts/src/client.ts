@@ -1,6 +1,7 @@
 import { buildWireStmt, decodeValue } from "./value.js"
 import { HttpStream } from "./http.js"
 import { WsStream } from "./ws.js"
+import type { WsCodec } from "./ws.js"
 import type { WireStmtResult } from "./types.js"
 import type { SqlParams, RowValue } from "./value.js"
 import { makeCacheKey } from "./cache_key.js"
@@ -172,12 +173,20 @@ export interface HranaConfig {
      * Required when using `cache: { persist: true }` on individual queries.
      */
     persistentCache?: PersistentCache
+    /**
+     * Wire encoding for WebSocket connections.
+     * - `"json"` (default) — text frames, human-readable.
+     * - `"msgpack"` — binary frames, more compact. Requires the server to
+     *   support the `hrana{N}-bin` subprotocol.
+     */
+    codec?: WsCodec
 }
 
 interface ResolvedConfig {
     url: string
     authToken: string | undefined
     version: "v1" | "v2" | "v3"
+    codec: WsCodec
     clearOnWrite: boolean
     persistentCache: PersistentCache | undefined
 }
@@ -212,6 +221,7 @@ export class HranaClient {
             url: cfg.url,
             authToken: cfg.authToken,
             version,
+            codec: cfg.codec ?? "json",
             clearOnWrite: cfg.cache?.clearOnWrite ?? false,
             persistentCache: cfg.persistentCache,
         }
@@ -428,7 +438,7 @@ export class HranaClient {
         }
 
         if (scheme === "ws" || scheme === "wss") {
-            return new WsStream(url, version, authToken)
+            return new WsStream(url, version, authToken, this.#cfg.codec)
         }
 
         throw new HranaError(`unsupported scheme "${scheme}"`)

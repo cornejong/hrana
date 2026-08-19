@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -169,15 +170,21 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 	// per-message allocations. ReadMessage slices into this buffer directly.
 	readBuf := make([]byte, 0, websockets.ReadLimitStandard)
 
+	var writeMu sync.Mutex
 	sendMsg := func(msg any) error {
 		data, err := codec.Encode(msg)
 		if err != nil {
 			s.wsLog.Error("failed to encode payload", "error", err)
 			return err
 		}
+
+		writeMu.Lock()
+		defer writeMu.Unlock()
+
 		if err := wsConn.StreamMessage(opCode, websockets.FrameSizeBalanced-12, bytes.NewReader(data)); err != nil {
 			s.wsLog.Error("failed to send message", "error", err)
 		}
+
 		return nil
 	}
 

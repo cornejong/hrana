@@ -3,15 +3,38 @@ package hrana
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 )
 
+var ErrStreamIsSuperseded = errors.New("stream is superseded by a newer one. Create a new stream")
+
+type GenerationalDB struct {
+	*sql.DB
+	generation int64
+}
+
+func (g *GenerationalDB) Generation() int64 {
+	return g.generation
+}
+
+type GenerationalConn struct {
+	*sql.Conn
+	generation int64
+}
+
+func (g *GenerationalConn) Generation() int64 {
+	return g.generation
+}
+
 // Stream represents a single Hrana stream – a pinned *sql.Conn plus
 // per-stream state (stored SQL texts, open cursors).
 type Stream struct {
-	ID        int32
-	Conn      *sql.Conn
+	ID           int32
+	Conn         *GenerationalConn
+	IsSuperseded bool
+
 	StoredSQL map[int32]string  // sql_id -> SQL text (V2+)
 	Cursors   map[int32]*Cursor // cursor_id -> Cursor (V3 WS only)
 	Mode      ConnectionMode    // readonly or readwrite (default)
@@ -22,7 +45,7 @@ type Stream struct {
 }
 
 // NewStream constructs a Stream that owns conn.
-func NewStream(id int32, conn *sql.Conn) *Stream {
+func NewStream(id int32, conn *GenerationalConn) *Stream {
 	return &Stream{
 		ID:        id,
 		Conn:      conn,
@@ -57,7 +80,10 @@ func (s *Stream) IsClosed() bool {
 // OpenStream creates a new Stream by acquiring a dedicated *sql.Conn from the
 // pool. The caller is responsible for calling Stream.Close when done.
 func (s *Server) OpenStream(ctx context.Context) (*Stream, error) {
-	conn, err := s.db.Conn(ctx)
+	db := s.db.Load()
+	dbGen := db.Generation() // Extract it here already to avoid race conditions.. Probably should make this mutexed or a lane
+
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("hrana: failed to obtain sql.Conn: %w", err)
 	}
@@ -68,7 +94,7 @@ func (s *Server) OpenStream(ctx context.Context) (*Stream, error) {
 		return nil, fmt.Errorf("hrana: failed to generate stream id: %w", err)
 	}
 
-	return NewStream(id, conn), nil
+	return NewStream(id, &GenerationalConn{Conn: conn, generation: dbGen}), nil
 }
 
 // ─── Cursor (V3) ─────────────────────────────────────────────────────────────
@@ -119,7 +145,37 @@ func newSession(mode ConnectionMode) *Session {
 func (sess *Session) addStream(id int32, st *Stream) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	st.ID = id
 	sess.streams[id] = st
+}
+
+// AddStreamAssinged assigns a unique random id to st and registers it in the
+// session. It returns the assigned id and true on success, or 0 and false if
+// no id could be generated.
+func (sess *Session) AddStreamAssinged(st *Stream) (int32, bool) {
+	if st == nil {
+		return 0, false
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	id, err := RandomInt32()
+	if err != nil {
+		return 0, false
+	}
+
+	for _, exists := sess.streams[id]; exists; {
+		id, err = RandomInt32()
+		if err != nil {
+			return 0, false
+		}
+		_, exists = sess.streams[id]
+	}
+
+	st.ID = id
+	sess.streams[id] = st
+	return id, true
 }
 
 func (sess *Session) getStream(id int32) (*Stream, bool) {

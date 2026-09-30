@@ -83,7 +83,8 @@ type Config struct {
 
 // Server holds the Hrana server state.
 type Server struct {
-	db          *sql.DB
+	db atomic.Pointer[GenerationalDB]
+
 	config      *Config
 	httpLog     *slog.Logger
 	wsLog       *slog.Logger
@@ -93,7 +94,7 @@ type Server struct {
 	wsConnCount int64 // accessed atomically
 	closing     atomic.Bool
 	wsMu        sync.Mutex
-	wsConns     map[websockets.Connection]struct{}
+	wsConns     map[websockets.Connection]*Session
 	wsConnPool  *websockets.ConnPool
 	wsAcceptor  *websockets.Acceptor
 	wg          sync.WaitGroup
@@ -130,16 +131,18 @@ func New(db *sql.DB, conf *Config) *Server {
 	}
 
 	s := &Server{
-		db:         db,
+		db:         atomic.Pointer[GenerationalDB]{},
 		config:     conf,
 		httpLog:    subLogger(base, "http"),
 		wsLog:      subLogger(base, "ws"),
 		batons:     newBatonStore(conf.BatonTTL),
 		ctx:        ctx,
 		cancel:     cancel,
-		wsConns:    make(map[websockets.Connection]struct{}),
+		wsConns:    make(map[websockets.Connection]*Session),
 		wsConnPool: pool,
 	}
+
+	s.db.Store(&GenerationalDB{DB: db})
 
 	acceptor := websockets.NewAcceptorWithConnPool(pool)
 	acceptor.Subprotocols = s.enabledSubprotocols()
@@ -151,6 +154,28 @@ func New(db *sql.DB, conf *Config) *Server {
 // ActiveWSConnections returns the number of currently active WebSocket connections.
 func (s *Server) ActiveWSConnections() int64 {
 	return atomic.LoadInt64(&s.wsConnCount)
+}
+
+func (s *Server) DatabaseGeneration() int64 {
+	return s.db.Load().Generation()
+}
+
+func (s *Server) EvolveDatabase(db *sql.DB) {
+	newGen := GenerationalDB{DB: db, generation: s.db.Load().Generation() + 1}
+	s.db.Swap(&newGen)
+
+	for _, sess := range s.wsConns {
+		for _, stream := range sess.streams {
+			if stream.Conn.Generation() == newGen.Generation() {
+				continue
+			}
+
+			stream.mu.Lock()
+			defer stream.mu.Unlock()
+
+			stream.IsSuperseded = true
+		}
+	}
 }
 
 // Done returns a channel that is closed when the server is shut down via Close.

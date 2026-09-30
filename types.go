@@ -317,8 +317,15 @@ type OpenStreamReq struct {
 	Type     string `json:"type" msgpack:"type"`
 	StreamID int32  `json:"stream_id" msgpack:"stream_id"`
 }
+type OpenStreamAssignedReq struct {
+	Type string `json:"type" msgpack:"type"`
+}
 type OpenStreamResp struct {
 	Type string `json:"type" msgpack:"type"`
+}
+type OpenStreamAssignedResp struct {
+	Type     string `json:"type" msgpack:"type"`
+	StreamID int32  `json:"stream_id" msgpack:"stream_id"`
 }
 
 type CloseStreamReq struct {

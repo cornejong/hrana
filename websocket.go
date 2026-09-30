@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -143,8 +144,11 @@ func extractWSRequest(payload []byte, codec Codec) (int32, []byte, error) {
 func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode ConnectionMode, remoteAddr string) {
 	s.wsLog.Debug("ws session started", slog.String("remote", remoteAddr), slog.String("proto", proto))
 
+	sess := newSession(mode)
+	defer sess.closeAll()
+
 	s.wsMu.Lock()
-	s.wsConns[wsConn] = struct{}{}
+	s.wsConns[wsConn] = sess
 	s.wsMu.Unlock()
 
 	s.wg.Add(1)
@@ -159,9 +163,6 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 			s.config.OnLastWSDisconnect()
 		}
 	}()
-
-	sess := newSession(mode)
-	defer sess.closeAll()
 
 	codec, opCode := codecForProto(proto)
 	authed := false
@@ -255,8 +256,13 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 				s.wsLog.Debug("ws request dispatched", slog.Int64("request_id", int64(id)), slog.String("remote", remoteAddr))
 				resp, respErr := s.dispatchWSRequest(id, raw, codec, sess, proto)
 				if respErr != nil {
+					errorType := "response_error"
+					if errors.Is(respErr, ErrStreamIsSuperseded) {
+						errorType = "stream_superseded_error"
+					}
+
 					_ = sendMsg(ResponseErrorMsg{
-						Type:      "response_error",
+						Type:      errorType,
 						RequestID: id,
 						Error:     Error{Message: respErr.Error()},
 					})
@@ -295,6 +301,13 @@ func (s *Server) dispatchWSRequest(requestID int32, rawReq []byte, codec Codec, 
 			return nil, err
 		}
 		return s.wsOpenStream(sess, req)
+
+	case "open_stream_assigned":
+		var req OpenStreamAssignedReq
+		if err := codec.Decode(rawReq, &req); err != nil {
+			return nil, err
+		}
+		return s.wsOpenStreamAssigned(sess, req)
 
 	case "close_stream":
 		var req CloseStreamReq
@@ -398,6 +411,22 @@ func (s *Server) wsOpenStream(sess *Session, req OpenStreamReq) (any, error) {
 	return OpenStreamResp{Type: "open_stream"}, nil
 }
 
+func (s *Server) wsOpenStreamAssigned(sess *Session, _ OpenStreamAssignedReq) (any, error) {
+	stream, err := s.OpenStream(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	stream.Mode = sess.Mode
+	streamID, stored := sess.AddStreamAssinged(stream)
+	if !stored {
+		return nil, fmt.Errorf("failed to store new stream")
+	}
+
+	s.wsLog.Debug("ws stream opened", slog.Int("stream_id", int(streamID)))
+	return OpenStreamAssignedResp{Type: "open_stream_assigned", StreamID: streamID}, nil
+}
+
 func (s *Server) wsCloseStream(sess *Session, req CloseStreamReq) (any, error) {
 	sess.removeStream(req.StreamID)
 	s.wsLog.Debug("ws stream closed", slog.Int("stream_id", int(req.StreamID)))
@@ -409,6 +438,13 @@ func (s *Server) wsExecute(sess *Session, req ExecuteReq) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	stream.Lock()
 	defer stream.Unlock()
 	result, err := executeStmt(s.ctx, stream, &req.Stmt, sess.storedSQL)
@@ -416,6 +452,7 @@ func (s *Server) wsExecute(sess *Session, req ExecuteReq) (any, error) {
 		s.wsLog.Debug("ws execute failed", slog.Int("stream_id", int(req.StreamID)), slog.String("error", err.Error()))
 		return nil, err
 	}
+
 	s.wsLog.Debug("ws execute ok", slog.Int("stream_id", int(req.StreamID)), slog.Uint64("rows_affected", result.AffectedRowCount), slog.Float64("duration_ms", result.QueryDurationMs))
 	return ExecuteResp{Type: "execute", Result: *result}, nil
 }
@@ -425,6 +462,13 @@ func (s *Server) wsBatch(sess *Session, req BatchReq) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	stream.Lock()
 	defer stream.Unlock()
 	result, err := executeBatch(s.ctx, stream, &req.Batch, sess.storedSQL)
@@ -449,6 +493,13 @@ func (s *Server) wsSequence(sess *Session, req SequenceReq) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	sqlText, err := sess.resolveSQL(req.SQL, req.SQLId)
 	if err != nil {
 		return nil, err
@@ -466,6 +517,13 @@ func (s *Server) wsDescribe(sess *Session, req DescribeReq) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	sqlText, err := sess.resolveSQL(req.SQL, req.SQLId)
 	if err != nil {
 		return nil, err
@@ -480,9 +538,17 @@ func (s *Server) wsDescribe(sess *Session, req DescribeReq) (any, error) {
 }
 
 func (s *Server) wsGetAutocommit(sess *Session, req GetAutocommitReq) (any, error) {
-	if _, ok := sess.getStream(req.StreamID); !ok {
+	stream, ok := sess.getStream(req.StreamID)
+	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	return GetAutocommitResp{Type: "get_autocommit", IsAutocommit: true}, nil
 }
 
@@ -491,6 +557,13 @@ func (s *Server) wsOpenCursor(sess *Session, req OpenCursorReq) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("hrana: stream_id %d not found", req.StreamID)
 	}
+
+	if stream.IsSuperseded {
+		defer sess.removeStream(req.StreamID)
+
+		return nil, ErrStreamIsSuperseded
+	}
+
 	stream.Lock()
 	entries, err := executeBatchCursor(s.ctx, stream, &req.Batch, sess.storedSQL)
 	stream.Unlock()

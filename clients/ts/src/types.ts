@@ -100,8 +100,15 @@ export interface WireResponseErrorMsg {
     error: { message: string }
 }
 
+export interface WireStreamSupersededErrorMsg {
+    type: "stream_superseded_error"
+    request_id: number
+    error: { message: string }
+}
+
 export type WireServerMsg =
     | WireHelloOkMsg
     | WireHelloErrorMsg
     | WireResponseOkMsg
     | WireResponseErrorMsg
+    | WireStreamSupersededErrorMsg

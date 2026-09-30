@@ -26,7 +26,7 @@ func testBlacklistConfig() BlacklistConfig {
 
 func newTestBlacklist(t *testing.T, cfg BlacklistConfig) *memoryBlacklist {
 	t.Helper()
-	bl := newMemoryBlacklist(cfg)
+	bl := NewMemoryBlacklist(cfg)
 	t.Cleanup(bl.Close)
 	return bl
 }
@@ -339,7 +339,7 @@ func TestMemoryBlacklist_SweepKeepsStillBlockedEntries(t *testing.T) {
 
 func TestMemoryBlacklist_CloseStopsSweep(t *testing.T) {
 	cfg := testBlacklistConfig()
-	bl := newMemoryBlacklist(cfg)
+	bl := NewMemoryBlacklist(cfg)
 	bl.Strike("addr")
 
 	bl.Close() // should not panic, and stops the background Interval

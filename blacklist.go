@@ -129,7 +129,7 @@ type memoryBlacklist struct {
 	sweep   *Interval
 }
 
-func newMemoryBlacklist(cfg BlacklistConfig) *memoryBlacklist {
+func NewMemoryBlacklist(cfg BlacklistConfig) *memoryBlacklist {
 	bl := &memoryBlacklist{
 		entries: make(map[string]*list.Element),
 		order:   list.New(),

@@ -182,7 +182,7 @@ func New(db *sql.DB, conf *Config) *Server {
 		if conf.Blacklist.Store != nil {
 			s.blacklist = conf.Blacklist.Store
 		} else {
-			s.blacklist = newMemoryBlacklist(conf.Blacklist)
+			s.blacklist = NewMemoryBlacklist(conf.Blacklist)
 		}
 	}
 

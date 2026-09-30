@@ -5,19 +5,24 @@ import { HranaError } from "./client"
 export type WsCodec = "json" | "msgpack"
 
 type PendingReq = {
+    payload: unknown
     resolve: (data: unknown) => void
     reject: (err: Error) => void
+    retries: number
 }
 
 export class WsStream {
+    #streamId = -1
+
     readonly #ws: WebSocket
-    readonly #streamId = 0
     readonly #codec: WsCodec
 
     #authToken: string | undefined
     #reqIdSeq = 0
     #pending = new Map<number, PendingReq>()
     #ready: Promise<void>
+    #recovering: Promise<void> | undefined
+    readonly #maxStreamRetries = 3
 
     constructor(url: string, version: "v1" | "v2" | "v3", authToken?: string, codec: WsCodec = "json") {
         this.#codec = codec
@@ -53,6 +58,9 @@ export class WsStream {
 
     async execute(stmt: WireStmt): Promise<WireStmtResult> {
         await this.#ready
+        if (this.#recovering) {
+            await this.#recovering
+        }
 
         const resp = await this.#sendRequest({ type: "execute", stream_id: this.#streamId, stmt })
         const r = resp as { type: string; result: WireStmtResult }
@@ -61,6 +69,9 @@ export class WsStream {
 
     async close(): Promise<void> {
         await this.#ready.catch(() => undefined)
+        if (this.#recovering) {
+            await this.#recovering.catch(() => undefined)
+        }
         await this.#sendRequest({ type: "close_stream", stream_id: this.#streamId }).catch(() => undefined)
         this.#ws.close(1000, "done")
     }
@@ -91,14 +102,23 @@ export class WsStream {
             this.#ws.addEventListener("message", onMsg)
         })
 
-        await this.#sendRequest({ type: "open_stream", stream_id: this.#streamId })
+        if (this.#streamId < 0) {
+            const resp = await this.#sendRequest({ type: "open_stream_assigned" }) as { stream_id: number }
+            this.#streamId = resp.stream_id
+        } else {
+            await this.#sendRequest({ type: "open_stream", stream_id: this.#streamId })
+        }
     }
 
     #sendRequest(payload: unknown): Promise<unknown> {
+        return this.#sendRequestWithRetries(payload, 0)
+    }
+
+    #sendRequestWithRetries(payload: unknown, retries: number): Promise<unknown> {
         const id = ++this.#reqIdSeq
 
         return new Promise<unknown>((resolve, reject) => {
-            this.#pending.set(id, { resolve, reject })
+            this.#pending.set(id, { payload, resolve, reject, retries })
 
             const msg = { type: "request", request_id: id, request: payload }
             try {
@@ -136,8 +156,8 @@ export class WsStream {
             return
         }
 
-        /* @ts-ignore-error The request_id field only exists on response type messages */
-        const pending = this.#pending.get(msg.request_id ?? -1)
+        const requestId = "request_id" in msg ? msg.request_id : -1
+        const pending = this.#pending.get(requestId)
         switch (msg.type) {
             case "hello_ok":
                 break
@@ -157,11 +177,60 @@ export class WsStream {
                 pending.reject(new HranaError(msg.error.message))
                 break
 
+            case "stream_superseded_error":
+                if (!pending) return
+                this.#pending.delete(msg.request_id)
+
+                const streamId = (pending.payload as { stream_id?: number }).stream_id
+                if (streamId === undefined || pending.retries >= this.#maxStreamRetries) {
+                    pending.reject(new HranaError(msg.error.message))
+                    break
+                }
+
+                this.#retrySuperseded(pending)
+                break
+
             default:
                 /* @ts-expect-error */
                 console.warn("hrana: unknown message type", msg.type, msg)
                 break
         }
+    }
+
+    async #retrySuperseded(pending: PendingReq): Promise<void> {
+        try {
+            await this.#recoverStream()
+            const payload = { ...(pending.payload as object), stream_id: this.#streamId }
+            const result = await this.#sendRequestWithRetries(payload, pending.retries + 1)
+            pending.resolve(result)
+        } catch (err) {
+            pending.reject(err instanceof Error ? err : new HranaError(String(err)))
+        }
+    }
+
+    async #recoverStream(): Promise<void> {
+        if (this.#recovering) {
+            return this.#recovering
+        }
+
+        this.#recovering = this.#doRecoverStream()
+        try {
+            await this.#recovering
+        } finally {
+            this.#recovering = undefined
+        }
+    }
+
+    async #doRecoverStream(): Promise<void> {
+        // Close the superseded stream (best effort).
+        if (this.#streamId >= 0) {
+            await this.#sendRequestWithRetries({ type: "close_stream", stream_id: this.#streamId }, 0)
+                .catch(() => undefined)
+        }
+
+        // Open a fresh stream on the current database generation.
+        const resp = await this.#sendRequestWithRetries({ type: "open_stream_assigned" }, 0) as { stream_id: number }
+        this.#streamId = resp.stream_id
     }
 
     #rejectAll(err: Error): void {

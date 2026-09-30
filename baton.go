@@ -10,26 +10,29 @@ import (
 
 // batonEntry holds a stream together with its last-access timestamp.
 type batonEntry struct {
-	stream    *Stream
-	lastSeen  time.Time
+	stream   *Stream
+	lastSeen time.Time
 }
 
 // batonStore is a thread-safe map from baton string → stream. A background
 // goroutine evicts entries that have exceeded the configured TTL.
 type batonStore struct {
-	mu      sync.Mutex
-	entries map[string]*batonEntry
-	ttl     time.Duration
-	stop    chan struct{}
+	mu            sync.Mutex
+	entries       map[string]*batonEntry
+	ttl           time.Duration
+	sweepInterval *Interval
 }
 
 func newBatonStore(ttl time.Duration) *batonStore {
 	bs := &batonStore{
 		entries: make(map[string]*batonEntry),
 		ttl:     ttl,
-		stop:    make(chan struct{}),
 	}
-	go bs.sweepLoop()
+
+	bs.sweepInterval = IntervalFunc(bs.ttl/2, func(interval *Interval) {
+		bs.sweep()
+	})
+
 	return bs
 }
 
@@ -63,6 +66,7 @@ func (bs *batonStore) Get(baton string) (*Stream, error) {
 	if !ok {
 		return nil, nil
 	}
+
 	entry.lastSeen = time.Now()
 	return entry.stream, nil
 }
@@ -76,26 +80,16 @@ func (bs *batonStore) Delete(baton string) {
 
 // Close stops the sweep goroutine and closes all remaining streams.
 func (bs *batonStore) Close() {
-	close(bs.stop)
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
+
+	bs.sweepInterval.Stop()
+
 	for _, e := range bs.entries {
 		e.stream.Close()
 	}
-	bs.entries = make(map[string]*batonEntry)
-}
 
-func (bs *batonStore) sweepLoop() {
-	ticker := time.NewTicker(bs.ttl / 2)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			bs.sweep()
-		case <-bs.stop:
-			return
-		}
-	}
+	bs.entries = make(map[string]*batonEntry)
 }
 
 func (bs *batonStore) sweep() {

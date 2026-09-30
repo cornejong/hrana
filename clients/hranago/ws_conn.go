@@ -14,29 +14,41 @@ import (
 )
 
 // wsConn is a driver.Conn backed by a persistent Hrana WebSocket connection.
-// One wsConn owns one server-side Hrana stream (stream_id = 0).
+// One wsConn owns one server-side Hrana stream. If the stream is superseded by
+// a newer database generation, the client transparently closes the old stream,
+// opens a fresh one, and retries the original request.
 //
 // The Hrana WS protocol works as follows:
 //  1. Client → hello  (with optional JWT)
 //  2. Server → hello_ok
-//  3. Client → request{open_stream, stream_id=0}
+//  3. Client → request{open_stream, stream_id=N}
 //  4. Server → response_ok
-//  5. Client → request{execute, stream_id=0, stmt=...}  (repeated)
-//  6. Client → request{close_stream, stream_id=0}  (on Close)
+//  5. Client → request{execute, stream_id=N, stmt=...}  (repeated)
+//  6. Client → request{close_stream, stream_id=N}  (on Close)
 type wsConn struct {
 	cfg      *config
 	ws       *websocket.Conn
 	writeMu  sync.Mutex // serialises ws.WriteMessage calls
 	mu       sync.Mutex // guards pending, closed, closeErr
 	reqIDSeq int32      // atomically incremented per request
-	pending  map[int32]chan wsResult
+	pending  map[int32]*wsPending
 	closed   bool
 	closeErr error
+
+	streamID         int32
+	recovering       chan struct{}
+	maxStreamRetries int32
 }
 
 type wsResult struct {
 	data json.RawMessage
 	err  error
+}
+
+type wsPending struct {
+	payload any
+	ch      chan wsResult
+	retries int32
 }
 
 // newWSConn dials the server, completes the Hrana hello handshake, opens
@@ -59,9 +71,11 @@ func newWSConn(cfg *config) (*wsConn, error) {
 	}
 
 	c := &wsConn{
-		cfg:     cfg,
-		ws:      ws,
-		pending: make(map[int32]chan wsResult),
+		cfg:              cfg,
+		ws:               ws,
+		pending:          make(map[int32]*wsPending),
+		streamID:         0,
+		maxStreamRetries: 3,
 	}
 
 	// Send hello.
@@ -138,7 +152,7 @@ func (c *wsConn) Close() error {
 	defer cancel()
 	_, _ = c.sendRequest(ctx, map[string]any{
 		"type":      "close_stream",
-		"stream_id": 0,
+		"stream_id": c.streamID,
 	})
 
 	_ = c.ws.WriteControl(
@@ -194,12 +208,12 @@ func (c *wsConn) QueryContext(ctx context.Context, query string, args []driver.N
 	return newRows(result), nil
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
+// ─── Internal helpers ──────────────────────────────────────────────────────────────
 
 func (c *wsConn) openStream(ctx context.Context) error {
 	_, err := c.sendRequest(ctx, map[string]any{
 		"type":      "open_stream",
-		"stream_id": 0,
+		"stream_id": c.streamID,
 	})
 	if err != nil {
 		return fmt.Errorf("hrana: ws open_stream: %w", err)
@@ -211,7 +225,7 @@ func (c *wsConn) openStream(ctx context.Context) error {
 func (c *wsConn) execStatement(ctx context.Context, s *stmt) (*stmtResult, error) {
 	resp, err := c.sendRequest(ctx, map[string]any{
 		"type":      "execute",
-		"stream_id": 0,
+		"stream_id": c.streamID,
 		"stmt":      s,
 	})
 	if err != nil {
@@ -231,6 +245,10 @@ func (c *wsConn) execStatement(ctx context.Context, s *stmt) (*stmtResult, error
 // sendRequest sends a Hrana request and blocks until the matching response
 // arrives on the read loop, or until ctx is cancelled.
 func (c *wsConn) sendRequest(ctx context.Context, payload any) (json.RawMessage, error) {
+	return c.sendRequestWithRetries(ctx, payload, 0)
+}
+
+func (c *wsConn) sendRequestWithRetries(ctx context.Context, payload any, retries int32) (json.RawMessage, error) {
 	id := atomic.AddInt32(&c.reqIDSeq, 1)
 
 	ch := make(chan wsResult, 1)
@@ -239,7 +257,7 @@ func (c *wsConn) sendRequest(ctx context.Context, payload any) (json.RawMessage,
 		c.mu.Unlock()
 		return nil, fmt.Errorf("hrana: ws connection is closed")
 	}
-	c.pending[id] = ch
+	c.pending[id] = &wsPending{payload: payload, ch: ch, retries: retries}
 	c.mu.Unlock()
 
 	msg := struct {
@@ -294,8 +312,8 @@ func (c *wsConn) readLoop() {
 		defer c.mu.Unlock()
 		c.closed = true
 		c.closeErr = readErr
-		for id, ch := range c.pending {
-			ch <- wsResult{err: readErr}
+		for id, p := range c.pending {
+			p.ch <- wsResult{err: readErr}
 			delete(c.pending, id)
 		}
 	}()
@@ -335,18 +353,116 @@ func (c *wsConn) readLoop() {
 				continue
 			}
 			c.dispatch(msg.RequestID, wsResult{err: fmt.Errorf("hrana: %s", msg.Error.Message)})
+
+		case "stream_superseded_error":
+			var msg struct {
+				RequestID int32      `json:"request_id"`
+				Error     hranaError `json:"error"`
+			}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			c.handleStreamSuperseded(msg.RequestID, msg.Error.Message)
 		}
 	}
 }
 
+func (c *wsConn) handleStreamSuperseded(requestID int32, message string) {
+	c.mu.Lock()
+	p, ok := c.pending[requestID]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.pending, requestID)
+	c.mu.Unlock()
+
+	go c.retrySupersededRequest(p, message)
+}
+
+func (c *wsConn) retrySupersededRequest(p *wsPending, message string) {
+	payloadMap, ok := p.payload.(map[string]any)
+	if !ok {
+		p.ch <- wsResult{err: fmt.Errorf("hrana: %s", message)}
+		return
+	}
+	if _, hasStreamID := payloadMap["stream_id"]; !hasStreamID {
+		p.ch <- wsResult{err: fmt.Errorf("hrana: %s", message)}
+		return
+	}
+	if p.retries >= c.maxStreamRetries {
+		p.ch <- wsResult{err: fmt.Errorf("hrana: %s", message)}
+		return
+	}
+
+	if err := c.recoverStream(); err != nil {
+		p.ch <- wsResult{err: err}
+		return
+	}
+
+	payloadMap["stream_id"] = c.streamID
+	result, err := c.sendRequestWithRetries(context.Background(), payloadMap, p.retries+1)
+	if err != nil {
+		p.ch <- wsResult{err: err}
+		return
+	}
+	p.ch <- wsResult{data: result}
+}
+
+func (c *wsConn) recoverStream() error {
+	c.mu.Lock()
+	if c.recovering != nil {
+		wait := c.recovering
+		c.mu.Unlock()
+		<-wait
+		return nil
+	}
+	done := make(chan struct{})
+	c.recovering = done
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		c.recovering = nil
+		close(done)
+		c.mu.Unlock()
+	}()
+
+	// Close the superseded stream (best effort).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = c.sendRequestWithRetries(ctx, map[string]any{
+		"type":      "close_stream",
+		"stream_id": c.streamID,
+	}, 0)
+
+	// Open a fresh stream with an assigned id.
+	resp, err := c.sendRequestWithRetries(ctx, map[string]any{
+		"type": "open_stream_assigned",
+	}, 0)
+	if err != nil {
+		return fmt.Errorf("hrana: ws recover stream: %w", err)
+	}
+
+	var assigned struct {
+		Type     string `json:"type"`
+		StreamID int32  `json:"stream_id"`
+	}
+	if err := json.Unmarshal(resp, &assigned); err != nil {
+		return fmt.Errorf("hrana: ws open_stream_assigned decode: %w", err)
+	}
+	c.streamID = assigned.StreamID
+	return nil
+}
+
 func (c *wsConn) dispatch(id int32, result wsResult) {
 	c.mu.Lock()
-	ch, ok := c.pending[id]
+	p, ok := c.pending[id]
 	if ok {
 		delete(c.pending, id)
 	}
 	c.mu.Unlock()
 	if ok {
-		ch <- result
+		p.ch <- result
 	}
 }

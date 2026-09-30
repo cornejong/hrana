@@ -28,6 +28,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if blocked, retryAfter := s.checkBlacklist(r.RemoteAddr); blocked {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSeconds(retryAfter)))
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		s.serveWSUpgrade(w, r)
 		return

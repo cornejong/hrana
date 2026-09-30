@@ -79,6 +79,11 @@ type Config struct {
 	// allowing multiple Server instances to share a single pool of pre-allocated
 	// connection buffers. If nil, a pool is created automatically on New.
 	WSConnPool *websockets.ConnPool
+
+	// Blacklist controls exponential-backoff blocking of remote addresses
+	// that repeatedly produce "instant" WebSocket failures. Disabled by
+	// default. See BlacklistConfig for details and defaults.
+	Blacklist BlacklistConfig
 }
 
 // Server holds the Hrana server state.
@@ -97,6 +102,7 @@ type Server struct {
 	wsConns     map[websockets.Connection]*Session
 	wsConnPool  *websockets.ConnPool
 	wsAcceptor  *websockets.Acceptor
+	blacklist   BlacklistChecker // nil when Config.Blacklist.Enabled is false
 	wg          sync.WaitGroup
 }
 
@@ -112,6 +118,30 @@ func New(db *sql.DB, conf *Config) *Server {
 
 	if conf.AuthFunc == nil {
 		conf.AuthFunc = func(token string) (*time.Time, error) { return nil, nil }
+	}
+
+	if conf.Blacklist.Enabled {
+		if conf.Blacklist.FreeStrikes == 0 {
+			conf.Blacklist.FreeStrikes = 2
+		}
+		if conf.Blacklist.InstantErrorThreshold == 0 {
+			conf.Blacklist.InstantErrorThreshold = 2 * time.Second
+		}
+		if conf.Blacklist.InitialBlock == 0 {
+			conf.Blacklist.InitialBlock = time.Second
+		}
+		if conf.Blacklist.Multiplier == 0 {
+			conf.Blacklist.Multiplier = 4
+		}
+		if conf.Blacklist.MaxBlock == 0 {
+			conf.Blacklist.MaxBlock = 15 * time.Minute
+		}
+		if conf.Blacklist.StrikeResetAfter == 0 {
+			conf.Blacklist.StrikeResetAfter = 10 * time.Minute
+		}
+		if conf.Blacklist.MaxTrackedAddrs == 0 {
+			conf.Blacklist.MaxTrackedAddrs = 10000
+		}
 	}
 
 	base := conf.Logger
@@ -147,6 +177,14 @@ func New(db *sql.DB, conf *Config) *Server {
 	acceptor := websockets.NewAcceptorWithConnPool(pool)
 	acceptor.Subprotocols = s.enabledSubprotocols()
 	s.wsAcceptor = acceptor
+
+	if conf.Blacklist.Enabled {
+		if conf.Blacklist.Store != nil {
+			s.blacklist = conf.Blacklist.Store
+		} else {
+			s.blacklist = newMemoryBlacklist(conf.Blacklist)
+		}
+	}
 
 	return s
 }
@@ -205,6 +243,9 @@ func (s *Server) Close(reason ...string) {
 	s.wg.Wait()
 	s.cancel()
 	s.batons.Close()
+	if closer, ok := s.blacklist.(interface{ Close() }); ok {
+		closer.Close()
+	}
 }
 
 // isVersionEnabled reports whether the given Hrana version (e.g. "v1", "v2", "v3")

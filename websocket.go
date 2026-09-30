@@ -28,6 +28,11 @@ func (s *Server) ServeConn(conn net.Conn) {
 		return
 	}
 
+	if blocked, retryAfter := s.checkBlacklist(conn.RemoteAddr().String()); blocked {
+		writeRawHTTP(conn, tooManyRequestsRawHTTP(retryAfter))
+		return
+	}
+
 	// bufio.Reader is used only to parse the HTTP upgrade headers. WebSocket
 	// clients do not send frame data before receiving the 101 response, so the
 	// read buffer will be empty before we hand the raw conn to the WS package.
@@ -68,13 +73,9 @@ func (s *Server) ServeConn(conn net.Conn) {
 
 // serveWSUpgrade handles a WebSocket upgrade that arrived via ServeHTTP.
 // The Acceptor performs validation, subprotocol negotiation, hijacking, and
-// the 101 handshake, returning a ready-to-use Connection.
+// the 101 handshake, returning a ready-to-use Connection. Blacklist and
+// server-closing checks already happened in ServeHTTP before this is called.
 func (s *Server) serveWSUpgrade(w http.ResponseWriter, r *http.Request) {
-	if s.closing.Load() {
-		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-
 	mode, err := parseMode(r.URL.Query().Get("mode"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -89,6 +90,65 @@ func (s *Server) serveWSUpgrade(w http.ResponseWriter, r *http.Request) {
 	defer wsConn.Close()
 
 	s.runWSSession(wsConn, wsConn.Subprotocol(), mode, r.RemoteAddr)
+}
+
+// ─── Blacklist helpers ────────────────────────────────────────────────────────
+
+// checkBlacklist reports whether remoteAddr is currently blocked, keyed by
+// its IP with the ephemeral port stripped. Always returns false when
+// blacklisting is disabled.
+func (s *Server) checkBlacklist(remoteAddr string) (blocked bool, retryAfter time.Duration) {
+	if s.blacklist == nil {
+		return false, 0
+	}
+	return s.blacklist.IsBlocked(remoteIP(remoteAddr))
+}
+
+// recordBlacklistStrike registers an instant-error strike for remoteAddr,
+// logging and firing Config.Blacklist.OnBlock when the strike causes the
+// address to become newly blocked. No-op when blacklisting is disabled.
+func (s *Server) recordBlacklistStrike(remoteAddr string) {
+	if s.blacklist == nil {
+		return
+	}
+	ip := remoteIP(remoteAddr)
+	blockedFor, strikes := s.blacklist.Strike(ip)
+	if blockedFor <= 0 {
+		return
+	}
+	s.wsLog.Warn("remote address blacklisted",
+		slog.String("remote", ip), slog.Int("strikes", strikes), slog.Duration("blocked_for", blockedFor))
+	if s.config.Blacklist.OnBlock != nil {
+		s.config.Blacklist.OnBlock(ip, strikes, blockedFor)
+	}
+}
+
+// retryAfterSeconds converts a block duration into a whole-second count
+// suitable for an HTTP Retry-After header, rounding up and never returning
+// less than 1.
+func retryAfterSeconds(d time.Duration) int {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
+
+// tooManyRequestsRawHTTP builds a raw HTTP/1.1 429 response with a
+// Retry-After header, for the pre-upgrade raw-TCP path in ServeConn.
+func tooManyRequestsRawHTTP(retryAfter time.Duration) string {
+	return fmt.Sprintf("HTTP/1.1 429 Too Many Requests\r\nRetry-After: %d\r\nContent-Length: 0\r\n\r\n", retryAfterSeconds(retryAfter))
+}
+
+// isBenignWSClose reports whether err represents an ordinary peer-initiated
+// close (normal closure 1000 or going-away 1001), as opposed to a genuine
+// protocol or I/O error worth logging at Error level.
+func isBenignWSClose(err error) bool {
+	if !errors.Is(err, websockets.ErrWebSocketClosed) {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasSuffix(msg, ": 1000") || strings.HasSuffix(msg, ": 1001")
 }
 
 // ─── Codec helpers ───────────────────────────────────────────────────────────
@@ -166,6 +226,15 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 
 	codec, opCode := codecForProto(proto)
 	authed := false
+	madeRequest := false
+	sessionStart := time.Now()
+	if s.blacklist != nil {
+		defer func() {
+			if time.Since(sessionStart) < s.config.Blacklist.InstantErrorThreshold && (!authed || !madeRequest) {
+				s.recordBlacklistStrike(remoteAddr)
+			}
+		}()
+	}
 
 	// Reuse a single read buffer for the lifetime of the session to avoid
 	// per-message allocations. ReadMessage slices into this buffer directly.
@@ -193,7 +262,11 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 		readBuf = readBuf[:0]
 		payload, op, err := wsConn.ReadMessage(readBuf)
 		if err != nil {
-			s.wsLog.Error("failed to read message", "error", err)
+			if isBenignWSClose(err) {
+				s.wsLog.Debug("ws read ended: peer closed", slog.String("remote", remoteAddr), "error", err)
+			} else {
+				s.wsLog.Error("failed to read message", "error", err)
+			}
 			return
 		}
 		if op != opCode {
@@ -240,6 +313,7 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 			_ = sendMsg(HelloOkMsg{Type: "hello_ok"})
 
 		case "request":
+			madeRequest = true
 			if !authed {
 				return
 			}

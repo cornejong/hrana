@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -241,7 +242,20 @@ func (s *Server) runWSSession(wsConn websockets.Connection, proto string, mode C
 	readBuf := make([]byte, 0, websockets.ReadLimitStandard)
 
 	var writeMu sync.Mutex
-	sendMsg := func(msg any) error {
+	sendMsg := func(msg any) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("[Hrana][RunWSSession] Panic recovered in sendMsg wrapper", "error", r, "stack", debug.Stack())
+
+				switch v := r.(type) {
+				case error:
+					err = v
+				default:
+					err = fmt.Errorf("panic: %v", v)
+				}
+			}
+		}()
+
 		data, err := codec.Encode(msg)
 		if err != nil {
 			s.wsLog.Error("failed to encode payload", "error", err)

@@ -18,3 +18,5 @@ lowbit.dev/websockets v0.1.0 h1:x+xMpwe5esJGbOsUna1hgax46wlyPWSmhN3ZO310SV0=
 lowbit.dev/websockets v0.1.0/go.mod h1:0wokjPQB+8eVYvGRos2aXRsY4Z3YQNE196F+FMzeimI=
 lowbit.dev/websockets v0.1.1 h1:lltFlSqjc38F088eDVAeSc6Oj4cBJBHcEAjoHjJBeCI=
 lowbit.dev/websockets v0.1.1/go.mod h1:0wokjPQB+8eVYvGRos2aXRsY4Z3YQNE196F+FMzeimI=
+lowbit.dev/websockets v0.1.2 h1:c7CggAcQaNxu2JNgiC8zombQFBqo4EY2Gi2+CWytSnY=
+lowbit.dev/websockets v0.1.2/go.mod h1:0wokjPQB+8eVYvGRos2aXRsY4Z3YQNE196F+FMzeimI=
